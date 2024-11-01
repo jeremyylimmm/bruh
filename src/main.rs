@@ -1,6 +1,8 @@
+mod renderer;
+
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
-fn main() {
+fn main() -> std::result::Result<(), &'static str> {
     unsafe {
         let wc = WNDCLASSA {
             hInstance: GetModuleHandleA(None).unwrap().into(),
@@ -34,6 +36,8 @@ fn main() {
 
         SetWindowLongPtrA(window, GWLP_USERDATA, &mut events as *mut WindowEvents as isize);
 
+        let renderer = renderer::Renderer::new(window)?;
+
         loop {
             let mut msg = MSG::default();
 
@@ -45,7 +49,11 @@ fn main() {
             if events.closed {
                 break;
             }
+
+            renderer.render();
         }
+
+        return Ok(());
     }
 }
 
