@@ -36,7 +36,7 @@ fn main() -> std::result::Result<(), &'static str> {
 
         SetWindowLongPtrA(window, GWLP_USERDATA, &mut events as *mut WindowEvents as isize);
 
-        let renderer = renderer::Renderer::new(window)?;
+        let mut renderer = renderer::Renderer::new(window)?;
 
         loop {
             let mut msg = MSG::default();
