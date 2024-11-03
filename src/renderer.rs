@@ -14,9 +14,12 @@ pub struct Renderer {
   swapchain_fences: [u64;DXGI_MAX_SWAP_CHAIN_BUFFERS as _],
   swapchain_rtvs: [D3D12_CPU_DESCRIPTOR_HANDLE;DXGI_MAX_SWAP_CHAIN_BUFFERS as _],
   swapchain_buffers: Vec<ID3D12Resource>,
+  swapchain_w: u32,
+  swapchain_h: u32,
   swapchain: IDXGISwapChain3,
+  window: HWND,
   rtv_heap: DescriptorHeap,
-  frame: usize
+  frame: usize,
 }
 
 impl Renderer {
@@ -128,7 +131,10 @@ impl Renderer {
         swapchain_fences: [0;DXGI_MAX_SWAP_CHAIN_BUFFERS as _],
         swapchain_rtvs: std::array::from_fn(|i|rtv_heap.cpu_handle(rtvs[i])),
         swapchain_buffers: Vec::new(),
+        swapchain_w: swapchain_desc.BufferDesc.Width,
+        swapchain_h: swapchain_desc.BufferDesc.Height,
         swapchain,
+        window,
         rtv_heap,
         frame: 0
       };
@@ -141,6 +147,8 @@ impl Renderer {
 
   pub fn render(&mut self) {
     unsafe{
+      self.match_window_size();
+
       let swapchain_index = self.swapchain.GetCurrentBackBufferIndex() as usize;
 
       let cmd_list = &self.cmd_lists[self.frame];
@@ -174,6 +182,28 @@ impl Renderer {
 
       self.frame = (self.frame + 1) % FRAMES_IN_FLIGHT;
     };
+  }
+
+  fn match_window_size(&mut self) {
+    let (ww, wh) = hwnd_size(self.window);
+
+    if ww == 0 || wh == 0 {
+      return;
+    }
+
+    if ww != self.swapchain_w || wh != self.swapchain_h {
+      self.wait_device_idle();
+
+      println!("Resizing {} {} -> {} {}", self.swapchain_w, self.swapchain_h, ww, wh);
+
+      self.swapchain_buffers.clear();
+      unsafe{self.swapchain.ResizeBuffers(0, ww, wh, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG::default()).unwrap()};
+
+      self.init_swapchain_resources();
+
+      self.swapchain_w = ww;
+      self.swapchain_h = wh;
+    }
   }
 
   fn init_swapchain_resources(&mut self) {
@@ -240,12 +270,12 @@ impl Drop for Renderer {
   }
 }
 
-fn hwnd_size(window: HWND) -> (i32, i32) {
+fn hwnd_size(window: HWND) -> (u32, u32) {
   let mut rect = RECT::default();
   unsafe{GetClientRect(window, &mut rect).unwrap()};
   return (
-    rect.right - rect.left,
-    rect.bottom - rect.top
+    (rect.right - rect.left) as _,
+    (rect.bottom - rect.top) as _
   );
 }
 
@@ -261,7 +291,7 @@ struct DescriptorHeap {
 
 type DescriptorHandle = u64;
 
-static NEXT_DESCRIPTOR_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static NEXT_DESCRIPTOR_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
 impl DescriptorHeap {
   fn new(device: &ID3D12Device, capacity: u32, desc_type: D3D12_DESCRIPTOR_HEAP_TYPE, flags: D3D12_DESCRIPTOR_HEAP_FLAGS) -> std::result::Result<DescriptorHeap, &'static str> {
