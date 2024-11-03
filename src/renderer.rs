@@ -4,6 +4,7 @@ use windows::core::*;
 const FRAMES_IN_FLIGHT: usize = 2;
 
 pub struct Renderer {
+  frame: usize,
   device: ID3D12Device,
   queue: ID3D12CommandQueue,
   fence_val: u64,
@@ -19,11 +20,12 @@ pub struct Renderer {
   swapchain: IDXGISwapChain3,
   window: HWND,
   rtv_heap: DescriptorHeap,
-  frame: usize,
+  root_signature: ID3D12RootSignature,
+  pipeline: ID3D12PipelineState,
 }
 
 impl Renderer {
-  pub fn new(window: HWND) -> std::result::Result<Renderer, &'static str> {
+  pub fn new(window: HWND) -> std::result::Result<Renderer, String> {
     unsafe {
       if cfg!(debug_assertions) {
         let mut debug_opt = Option::<ID3D12Debug>::None;
@@ -34,7 +36,7 @@ impl Renderer {
             debug.EnableDebugLayer();
           },
           _ => {
-            return Err("Failed to enable debug layer");
+            return Err("Failed to enable debug layer".into());
           }
         }
 
@@ -46,7 +48,7 @@ impl Renderer {
 
       let device = match device_opt {
         Some(dev) => {dev},
-        _ => { return Err("Failed to create device"); }
+        _ => { return Err("Failed to create device".into()); }
       };
 
 
@@ -106,13 +108,13 @@ impl Renderer {
 
       let mut swapchain_opt = Option::<IDXGISwapChain>::None;
       if factory.CreateSwapChain(&queue, &swapchain_desc, &mut swapchain_opt).is_err()  {
-        return Err("Failed to create first swap chain");
+        return Err("Failed to create first swap chain".into());
       }
 
       let swapchain: IDXGISwapChain3 = match swapchain_opt {
         Some(sc) => { sc.cast::<IDXGISwapChain3>().map_err(|_|"Failed to create swapchain")? },
         _ => {
-          return Err("Failed to create second swap chain");
+          return Err("Failed to create second swap chain".into());
         },
       };
 
@@ -120,7 +122,99 @@ impl Renderer {
 
       let rtvs: [DescriptorHandle;DXGI_MAX_SWAP_CHAIN_BUFFERS as _] = std::array::from_fn(|_|rtv_heap.alloc());
 
+      let vs_code = load_shader("shaders/triangle.vso")?;
+      let ps_code = load_shader("shaders/triangle.pso")?;
+
+      let root_signature_desc = D3D12_ROOT_SIGNATURE_DESC {
+        ..Default::default()
+      };
+
+      let mut root_signature_code_opt: Option<ID3DBlob> = None;
+      D3D12SerializeRootSignature(&root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut root_signature_code_opt, None).map_err(|_|"Failed to serialize root signature")?;
+      let root_signature_code = root_signature_code_opt.unwrap();
+
+      let root_signature = device.CreateRootSignature(
+        0,
+        std::slice::from_raw_parts(root_signature_code.GetBufferPointer() as _, root_signature_code.GetBufferSize())
+      ).map_err(|_|"Failed to create root signature")?;
+
+      let mut pipeline_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::transmute_copy(&root_signature),
+
+        VS: D3D12_SHADER_BYTECODE {
+          pShaderBytecode: vs_code.as_ptr() as _,
+          BytecodeLength: vs_code.len()
+        },
+
+        PS: D3D12_SHADER_BYTECODE {
+          pShaderBytecode: ps_code.as_ptr() as _,
+          BytecodeLength: ps_code.len()
+        },
+
+        BlendState: D3D12_BLEND_DESC {
+          RenderTarget: std::array::from_fn(|_|D3D12_RENDER_TARGET_BLEND_DESC{
+            SrcBlend:	D3D12_BLEND_ONE,
+            BlendOp:	D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha:	D3D12_BLEND_ONE,
+            BlendOpAlpha:	D3D12_BLEND_OP_ADD,
+            LogicOp:	D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: 0b1111,
+            ..Default::default()
+          }),
+          ..Default::default()
+        },
+
+        SampleMask: 0xffffffff,
+
+        RasterizerState: D3D12_RASTERIZER_DESC {
+          FillMode:	D3D12_FILL_MODE_SOLID,
+          CullMode:	D3D12_CULL_MODE_BACK,
+          FrontCounterClockwise: TRUE,
+          DepthClipEnable:	TRUE,
+          ..Default::default()
+        },
+
+        DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+          DepthEnable:	FALSE,
+          DepthWriteMask:	D3D12_DEPTH_WRITE_MASK_ALL,
+          DepthFunc:	D3D12_COMPARISON_FUNC_LESS,
+          StencilEnable: FALSE,
+          StencilReadMask:	D3D12_DEFAULT_STENCIL_READ_MASK as _,
+          StencilWriteMask:	D3D12_DEFAULT_STENCIL_WRITE_MASK as _,
+
+          BackFace: D3D12_DEPTH_STENCILOP_DESC{
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+          }, 
+
+          FrontFace: D3D12_DEPTH_STENCILOP_DESC{
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+          }, 
+        },
+
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+
+        NumRenderTargets: 1,
+
+        SampleDesc: DXGI_SAMPLE_DESC {
+          Count: 1,
+          Quality: 0
+        },
+        
+        ..Default::default()
+      };
+
+      pipeline_desc.RTVFormats[0] = swapchain_desc.BufferDesc.Format;
+
+      let pipeline = device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed t create pipeline")?;
+      
       let mut renderer = Renderer {
+        frame: 0,
         device,
         queue,
         fence_val: 0,
@@ -136,7 +230,8 @@ impl Renderer {
         swapchain,
         window,
         rtv_heap,
-        frame: 0
+        root_signature,
+        pipeline,
       };
 
       renderer.init_swapchain_resources();
@@ -164,6 +259,30 @@ impl Renderer {
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
 
       cmd_list.ClearRenderTargetView(self.swapchain_rtvs[swapchain_index], &[0.2, 0.3, 0.3, 1.0], None); 
+      cmd_list.OMSetRenderTargets(1, Some(&self.swapchain_rtvs[swapchain_index]), None, None);
+
+      cmd_list.SetGraphicsRootSignature(&self.root_signature);
+      cmd_list.SetPipelineState(&self.pipeline);
+
+      cmd_list.RSSetViewports(&[
+        D3D12_VIEWPORT {
+          Width: self.swapchain_w as f32,
+          Height: self.swapchain_h as f32,
+          MaxDepth: 1.0,
+          ..Default::default()
+        }
+      ]);
+
+      cmd_list.RSSetScissorRects(&[
+        RECT {
+          right: self.swapchain_w as _,
+          bottom: self.swapchain_h as _,
+          ..Default::default()
+        }
+      ]);
+
+      cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      cmd_list.DrawInstanced(3, 1, 0, 0);
 
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
 
@@ -193,8 +312,6 @@ impl Renderer {
 
     if ww != self.swapchain_w || wh != self.swapchain_h {
       self.wait_device_idle();
-
-      println!("Resizing {} {} -> {} {}", self.swapchain_w, self.swapchain_h, ww, wh);
 
       self.swapchain_buffers.clear();
       unsafe{self.swapchain.ResizeBuffers(0, ww, wh, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG::default()).unwrap()};
@@ -262,6 +379,10 @@ fn transition_barrier(resource: &ID3D12Resource, state_before: D3D12_RESOURCE_ST
       
     ..Default::default()
   };
+}
+
+fn load_shader(path: &str) -> std::result::Result<Vec<u8>, String> {
+  return std::fs::read(path).map_err(|_|format!("Missing file {}", path));
 }
 
 impl Drop for Renderer {

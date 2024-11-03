@@ -2,7 +2,7 @@ mod renderer;
 
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
-fn main() -> std::result::Result<(), &'static str> {
+fn main() -> std::result::Result<(), String> {
     unsafe {
         let wc = WNDCLASSA {
             hInstance: GetModuleHandleA(None).unwrap().into(),
