@@ -14,11 +14,15 @@ struct VSOut {
   float3 color : Color;
 };
 
+cbuffer Camera : register(b0, space0) {
+  float4x4 view_proj;
+};
+
 VSOut vs_main(uint vid : SV_VertexID) {
   Vertex vertex = vbuffer[vid];
 
   VSOut vso;
-  vso.sv_pos = float4(vertex.pos, 1.0f);
+  vso.sv_pos = mul(float4(vertex.pos, 1.0f), view_proj);
   vso.color = vertex.norm;
 
   return vso;

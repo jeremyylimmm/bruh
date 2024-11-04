@@ -1,4 +1,5 @@
 mod renderer;
+mod matrix;
 
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
@@ -38,6 +39,8 @@ fn main() -> std::result::Result<(), String> {
 
         let mut renderer = renderer::Renderer::new(window)?;
 
+        let start = std::time::Instant::now();
+
         loop {
             let mut msg = MSG::default();
 
@@ -50,7 +53,7 @@ fn main() -> std::result::Result<(), String> {
                 break;
             }
 
-            renderer.render();
+            renderer.render(start.elapsed().as_secs_f32());
         }
 
         return Ok(());

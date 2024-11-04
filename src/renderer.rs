@@ -1,8 +1,11 @@
 use windows::Win32::{Graphics::Direct3D12::*, Graphics::Direct3D::*, Graphics::Dxgi::Common::*, Graphics::Dxgi::*, Foundation::*, UI::WindowsAndMessaging::*};
 use windows::core::*;
 
+use crate::matrix;
+
 const FRAMES_IN_FLIGHT: usize = 2;
 
+#[allow(dead_code)]
 pub struct Renderer {
   frame: usize,
   device: ID3D12Device,
@@ -22,6 +25,7 @@ pub struct Renderer {
   rtv_heap: DescriptorHeap,
   root_signature: ID3D12RootSignature,
   pipeline: ID3D12PipelineState,
+  camera_cbuffer: BufferedBuffer<matrix::Float4x4>,
 }
 
 impl Renderer {
@@ -125,7 +129,22 @@ impl Renderer {
       let vs_code = load_shader("shaders/triangle.vso")?;
       let ps_code = load_shader("shaders/triangle.pso")?;
 
+      let root_params = [
+        D3D12_ROOT_PARAMETER{
+          ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+          ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+          Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor:  D3D12_ROOT_DESCRIPTOR {
+              ShaderRegister: 0,
+              RegisterSpace: 0
+            }
+          },
+        }
+      ];
+
       let root_signature_desc = D3D12_ROOT_SIGNATURE_DESC {
+        pParameters: root_params.as_ptr(),
+        NumParameters: root_params.len() as u32,
         ..Default::default()
       };
 
@@ -214,6 +233,7 @@ impl Renderer {
       let pipeline = device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed t create pipeline")?;
       
       let mut renderer = Renderer {
+        camera_cbuffer: BufferedBuffer::new(&device),
         frame: 0,
         device,
         queue,
@@ -240,7 +260,7 @@ impl Renderer {
     }
   }
 
-  pub fn render(&mut self) {
+  pub fn render(&mut self, time: f32) {
     unsafe{
       self.match_window_size();
 
@@ -282,6 +302,17 @@ impl Renderer {
       ]);
 
       cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+      let cam_data = self.camera_cbuffer.get(self.frame);
+      let camera_transform = matrix::translation(&[time.sin()*3.0, 0.0, time.cos()*3.0]) * matrix::rotation(&matrix::quaternion_roll_pitch_yaw(0.0, 0.0, time));
+
+      let view_matrix = camera_transform.inverse().expect("Failed to inverse camera matrix");
+      let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
+      let proj_matrix = matrix::perspective_rh(3.1415 * 0.25, aspect, 0.1, 1000.0);
+      *cam_data = proj_matrix * view_matrix;
+
+      cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame));
+
       cmd_list.DrawInstanced(3, 1, 0, 0);
 
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
@@ -369,12 +400,12 @@ fn transition_barrier(resource: &ID3D12Resource, state_before: D3D12_RESOURCE_ST
     Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
 
     Anonymous: D3D12_RESOURCE_BARRIER_0 {
-      Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-        pResource: unsafe{std::mem::transmute_copy(resource)},
+      Transition: unsafe{std::mem::transmute_copy(&D3D12_RESOURCE_TRANSITION_BARRIER {
+        pResource: std::mem::transmute_copy(resource),
         Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
         StateBefore: state_before,
         StateAfter: state_after,
-      })
+      })}
     },
       
     ..Default::default()
@@ -400,9 +431,10 @@ fn hwnd_size(window: HWND) -> (u32, u32) {
   );
 }
 
+#[allow(dead_code)]
 struct DescriptorHeap {
   id: u8,
-  heap: ID3D12DescriptorHeap,
+  heap: ID3D12DescriptorHeap, // Need to keep reference
   free_list: Vec<u32>,
   generation: Vec<u32>,
   stride: usize,
@@ -414,6 +446,7 @@ type DescriptorHandle = u64;
 
 static NEXT_DESCRIPTOR_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
+#[allow(dead_code)]
 impl DescriptorHeap {
   fn new(device: &ID3D12Device, capacity: u32, desc_type: D3D12_DESCRIPTOR_HEAP_TYPE, flags: D3D12_DESCRIPTOR_HEAP_FLAGS) -> std::result::Result<DescriptorHeap, &'static str> {
     unsafe{
@@ -492,5 +525,63 @@ impl DescriptorHeap {
     return D3D12_GPU_DESCRIPTOR_HANDLE {
       ptr: self.gpu_base.ptr + (index * self.stride) as u64
     };
+  }
+}
+
+struct BufferedBuffer<T> {
+  resource: ID3D12Resource,
+  ptrs: [*mut T; FRAMES_IN_FLIGHT]
+}
+
+impl<T> BufferedBuffer<T> {
+  fn padded_size() -> usize {
+    let sz = std::mem::size_of::<T>();
+    return (sz + 255) & !(255 as usize);
+  }
+
+  fn new(device: &ID3D12Device) -> Self {
+    unsafe {
+      let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: (Self::padded_size() * FRAMES_IN_FLIGHT) as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+          Count: 1,
+          Quality: 0
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+      };
+
+      let heap_props = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        ..Default::default()
+      };
+
+      let mut resource_opt: Option<ID3D12Resource> = None;
+      device.CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource_opt).expect("Buffer creation failed");
+      let resource = resource_opt.unwrap();
+
+      let mut void_ptr = std::ptr::null_mut::<std::ffi::c_void>();
+      resource.Map(0, None, Some(&mut void_ptr)).expect("Failed to map buffer");
+      let ptr_base = void_ptr as *mut T;
+
+      let ptrs = std::array::from_fn(|i|ptr_base.byte_add(i * Self::padded_size()));
+
+      return Self {
+        resource,
+        ptrs,
+      };
+    }
+  }
+
+  fn get(&self, frame: usize) -> &mut T {
+    return unsafe{&mut(*self.ptrs[frame])};
+  }
+
+  fn gpu_virtual_address(&self, frame: usize) -> u64 {
+    return unsafe{self.resource.GetGPUVirtualAddress() + (frame * Self::padded_size()) as u64};
   }
 }
