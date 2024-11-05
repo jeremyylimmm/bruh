@@ -15,12 +15,15 @@ cbuffer Camera : register(b0, space0) {
 
 cbuffer InstanceData : register(b1, space0) {
   uint vbuffer_index;
+  uint ibuffer_index;
 }
 
 StructuredBuffer<Vertex> vbuffers[] : register(t0, space0); 
+StructuredBuffer<uint> ibuffers[] : register(t0, space1); 
 
 VSOut vs_main(uint vid : SV_VertexID) {
-  Vertex vertex = vbuffers[vbuffer_index][vid];
+  uint index = ibuffers[ibuffer_index][vid];
+  Vertex vertex = vbuffers[vbuffer_index][index];
 
   VSOut vso;
   vso.sv_pos = mul(float4(vertex.pos, 1.0f), view_proj);
