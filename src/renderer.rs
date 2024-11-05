@@ -23,9 +23,19 @@ pub struct Renderer {
   swapchain: IDXGISwapChain3,
   window: HWND,
   rtv_heap: DescriptorHeap,
+  cbv_srv_uav_heap: DescriptorHeap,
   root_signature: ID3D12RootSignature,
   pipeline: ID3D12PipelineState,
   camera_cbuffer: BufferedBuffer<matrix::Float4x4>,
+  vbuffer_srv: DescriptorHandle,
+  vbuffer: ID3D12Resource,
+}
+
+#[repr(C)]
+struct Vertex {
+  pos: [f32;3],
+  norm: [f32;3],
+  tex_coord: [f32;2],
 }
 
 impl Renderer {
@@ -123,11 +133,22 @@ impl Renderer {
       };
 
       let mut rtv_heap=DescriptorHeap::new(&device, 1024, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
+      let mut cbv_srv_uav_heap = DescriptorHeap::new(&device, 1000000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
 
       let rtvs: [DescriptorHandle;DXGI_MAX_SWAP_CHAIN_BUFFERS as _] = std::array::from_fn(|_|rtv_heap.alloc());
 
       let vs_code = load_shader("shaders/triangle.vso")?;
       let ps_code = load_shader("shaders/triangle.pso")?;
+
+      let ranges = [
+        D3D12_DESCRIPTOR_RANGE {
+          RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+          NumDescriptors: 0xffffffff,
+          BaseShaderRegister: 0,
+          RegisterSpace: 0,
+          OffsetInDescriptorsFromTableStart: 0
+        }
+      ];
 
       let root_params = [
         D3D12_ROOT_PARAMETER{
@@ -137,6 +158,27 @@ impl Renderer {
             Descriptor:  D3D12_ROOT_DESCRIPTOR {
               ShaderRegister: 0,
               RegisterSpace: 0
+            }
+          }
+        },
+        D3D12_ROOT_PARAMETER {
+          ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+          ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+          Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+              ShaderRegister: 1,
+              RegisterSpace: 0,
+              Num32BitValues: 1
+            }
+          }
+        },
+        D3D12_ROOT_PARAMETER{
+          ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+          ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+          Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+              NumDescriptorRanges: ranges.len() as u32,
+              pDescriptorRanges: ranges.as_ptr()
             }
           },
         }
@@ -231,6 +273,48 @@ impl Renderer {
       pipeline_desc.RTVFormats[0] = swapchain_desc.BufferDesc.Format;
 
       let pipeline = device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed t create pipeline")?;
+
+      let vertex_data = [
+        Vertex {
+          pos: [0.0, 0.5, 0.0],
+          norm: [1.0, 0.0, 0.0],
+          tex_coord: [0.0, 0.0]
+        },
+        Vertex {
+          pos: [-0.5, -0.5, 0.0],
+          norm: [0.0, 1.0, 0.0],
+          tex_coord: [0.0, 0.0]
+        },
+        Vertex {
+          pos: [0.5, -0.5, 0.0],
+          norm: [0.0, 0.0, 1.0],
+          tex_coord: [0.0, 0.0]
+        }
+      ];
+
+      let vbuffer = make_buffer(&device, std::mem::size_of_val(&vertex_data), D3D12_HEAP_TYPE_UPLOAD);
+
+      let mut ptr = std::ptr::null_mut::<std::ffi::c_void>();
+      vbuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
+      std::ptr::copy_nonoverlapping(vertex_data.as_ptr(), ptr as _, vertex_data.len());
+      vbuffer.Unmap(0, None);
+
+      let vbuffer_srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+          Buffer: D3D12_BUFFER_SRV {
+            FirstElement: 0,
+            NumElements: vertex_data.len() as u32,
+            StructureByteStride: std::mem::size_of::<Vertex>() as u32,
+            ..Default::default()
+          }
+        },
+        ..Default::default()
+      };
+
+      let vbuffer_srv = cbv_srv_uav_heap.alloc();
+      device.CreateShaderResourceView(&vbuffer, Some(&vbuffer_srv_desc), cbv_srv_uav_heap.cpu_handle(vbuffer_srv));
       
       let mut renderer = Renderer {
         camera_cbuffer: BufferedBuffer::new(&device),
@@ -250,8 +334,11 @@ impl Renderer {
         swapchain,
         window,
         rtv_heap,
+        cbv_srv_uav_heap,
         root_signature,
         pipeline,
+        vbuffer,
+        vbuffer_srv
       };
 
       renderer.init_swapchain_resources();
@@ -284,6 +371,9 @@ impl Renderer {
       cmd_list.SetGraphicsRootSignature(&self.root_signature);
       cmd_list.SetPipelineState(&self.pipeline);
 
+      cmd_list.SetDescriptorHeaps(&[Some(self.cbv_srv_uav_heap.heap.clone())]);
+      cmd_list.SetGraphicsRootDescriptorTable(2, self.cbv_srv_uav_heap.gpu_base);
+
       cmd_list.RSSetViewports(&[
         D3D12_VIEWPORT {
           Width: self.swapchain_w as f32,
@@ -313,6 +403,7 @@ impl Renderer {
 
       cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame));
 
+      cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(self.vbuffer_srv) as u32, 0); // Set vbuffer index
       cmd_list.DrawInstanced(3, 1, 0, 0);
 
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
@@ -528,6 +619,34 @@ impl DescriptorHeap {
   }
 }
 
+fn make_buffer(device: &ID3D12Device, size: usize, heap_type: D3D12_HEAP_TYPE) -> ID3D12Resource {
+  unsafe {
+    let desc = D3D12_RESOURCE_DESC {
+      Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+      Width: size as u64,
+      Height: 1,
+      DepthOrArraySize: 1,
+      MipLevels: 1,
+      SampleDesc: DXGI_SAMPLE_DESC {
+        Count: 1,
+        Quality: 0
+      },
+      Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+      ..Default::default()
+    };
+
+    let heap_props = D3D12_HEAP_PROPERTIES {
+      Type: heap_type,
+      ..Default::default()
+    };
+
+    let mut resource_opt: Option<ID3D12Resource> = None;
+    device.CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource_opt).expect("Buffer creation failed");
+
+    return resource_opt.unwrap();
+  }
+}
+
 struct BufferedBuffer<T> {
   resource: ID3D12Resource,
   ptrs: [*mut T; FRAMES_IN_FLIGHT]
@@ -541,28 +660,7 @@ impl<T> BufferedBuffer<T> {
 
   fn new(device: &ID3D12Device) -> Self {
     unsafe {
-      let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: (Self::padded_size() * FRAMES_IN_FLIGHT) as u64,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-          Count: 1,
-          Quality: 0
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-      };
-
-      let heap_props = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_UPLOAD,
-        ..Default::default()
-      };
-
-      let mut resource_opt: Option<ID3D12Resource> = None;
-      device.CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource_opt).expect("Buffer creation failed");
-      let resource = resource_opt.unwrap();
+      let resource = make_buffer(device, Self::padded_size() * FRAMES_IN_FLIGHT, D3D12_HEAP_TYPE_UPLOAD);
 
       let mut void_ptr = std::ptr::null_mut::<std::ffi::c_void>();
       resource.Map(0, None, Some(&mut void_ptr)).expect("Failed to map buffer");

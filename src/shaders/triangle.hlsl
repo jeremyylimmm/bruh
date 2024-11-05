@@ -1,12 +1,7 @@
 struct Vertex {
   float3 pos;
   float3 norm;
-};
-
-static Vertex vbuffer[] = {
-  {{ 0.0f,  0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
-  {{-0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
-  {{ 0.5f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}},
+  float2 tex_coord;
 };
 
 struct VSOut {
@@ -18,8 +13,14 @@ cbuffer Camera : register(b0, space0) {
   float4x4 view_proj;
 };
 
+cbuffer InstanceData : register(b1, space0) {
+  uint vbuffer_index;
+}
+
+StructuredBuffer<Vertex> vbuffers[] : register(t0, space0); 
+
 VSOut vs_main(uint vid : SV_VertexID) {
-  Vertex vertex = vbuffer[vid];
+  Vertex vertex = vbuffers[vbuffer_index][vid];
 
   VSOut vso;
   vso.sv_pos = mul(float4(vertex.pos, 1.0f), view_proj);

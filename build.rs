@@ -25,8 +25,8 @@ enum ShaderKind {
 impl ShaderKind {
   fn target(&self) -> &str {
     return match self {
-      Self::Vertex => { "vs_5_1" },
-      Self::Pixel => { "ps_5_1" },
+      Self::Vertex => { "vs_6_0" },
+      Self::Pixel => { "ps_6_0" },
     };
   }
 

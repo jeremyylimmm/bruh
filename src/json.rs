@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::result::Result;
 
-#[derive(Debug)]
+#[allow(unused)]
 pub enum Node {
   Null,
   Integer(u64),
@@ -78,6 +78,10 @@ impl Parser {
     let first = self.consume_char();
 
     return Ok( match first {
+      '\0' => {
+        Token::Eof
+      }
+
       '"' => {
         while self.peek_char() != '"' && self.peek_char() != '\0' {
           self.consume_char();
@@ -160,7 +164,7 @@ impl Parser {
 
   fn lex_char(&mut self) -> Result<char, String> {
     if let Token::Char(c) = self.peek()? {
-      let _ = self.lex();
+      self.lex()?;
       return Ok(c);
     }
     else {
@@ -195,7 +199,7 @@ impl Parser {
 
       match self.peek()? {
         Token::String(name) => {
-          self.lex();
+          self.lex()?;
 
           if let Token::Char(c) = self.lex()? {
             if c != ':' {
@@ -275,7 +279,7 @@ impl Parser {
       },
       Token::Ident(val) => {
         if val == "null" {
-          let _ = self.lex();
+          self.lex()?;
           return Ok(Box::new(Node::Null));
         }
         else {
@@ -299,6 +303,7 @@ impl Parser {
   }
 }
 
+#[allow(unused)]
 pub fn parse(text: &String) -> Result<Box<Node>, String> {
   let mut p = Parser {
     text: text.chars().collect(),
