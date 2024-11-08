@@ -16,18 +16,26 @@ cbuffer Camera : register(b0, space0) {
 cbuffer InstanceData : register(b1, space0) {
   uint vbuffer_index;
   uint ibuffer_index;
+  uint transform_index;
 }
+
+struct Transform {
+  float4x4 m;
+};
 
 StructuredBuffer<Vertex> vbuffers[] : register(t0, space0); 
 StructuredBuffer<uint> ibuffers[] : register(t0, space1); 
+ConstantBuffer<Transform> transforms[] : register(b0, space2);
 
 VSOut vs_main(uint vid : SV_VertexID) {
   uint index = ibuffers[ibuffer_index][vid];
   Vertex vertex = vbuffers[vbuffer_index][index];
 
+  float4x4 transform = transforms[transform_index].m;
+
   VSOut vso;
-  vso.sv_pos = mul(float4(vertex.pos, 1.0f), view_proj);
-  vso.norm = normalize(vertex.norm);
+  vso.sv_pos = mul(mul(float4(vertex.pos, 1.0f), transform), view_proj);
+  vso.norm = normalize(mul(float4(vertex.norm, 0.0f), transform));
 
   return vso;
 }

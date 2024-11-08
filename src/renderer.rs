@@ -1,7 +1,7 @@
 use windows::Win32::{Graphics::Direct3D12::*, Graphics::Direct3D::*, Graphics::Dxgi::Common::*, Graphics::Dxgi::*, Foundation::*, UI::WindowsAndMessaging::*};
 use windows::core::*;
 
-use crate::matrix;
+use crate::matrix::{self, Float4x4};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 
@@ -30,6 +30,7 @@ pub struct Renderer {
   camera_cbuffer: BufferedBuffer<matrix::Float4x4>,
   depth_buffer: Option<ID3D12Resource>,
   dsv: DescriptorHandle,
+  transform_pool: TransformPool,
 }
 
 #[repr(C)]
@@ -134,7 +135,7 @@ impl Renderer {
       };
 
       let mut rtv_heap=DescriptorHeap::new(&device, 1024, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
-      let cbv_srv_uav_heap = DescriptorHeap::new(&device, 1000000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+      let mut cbv_srv_uav_heap = DescriptorHeap::new(&device, 1000000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
       let mut dsv_heap = DescriptorHeap::new(&device, 1024, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
 
       let rtvs: [DescriptorHandle;DXGI_MAX_SWAP_CHAIN_BUFFERS as _] = std::array::from_fn(|_|rtv_heap.alloc());
@@ -155,6 +156,13 @@ impl Renderer {
           NumDescriptors: 0xffffffff,
           BaseShaderRegister: 0,
           RegisterSpace: 1,
+          OffsetInDescriptorsFromTableStart: 0
+        },
+        D3D12_DESCRIPTOR_RANGE {
+          RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+          NumDescriptors: 0xffffffff,
+          BaseShaderRegister: 0,
+          RegisterSpace: 2,
           OffsetInDescriptorsFromTableStart: 0
         }
       ];
@@ -177,7 +185,7 @@ impl Renderer {
             Constants: D3D12_ROOT_CONSTANTS {
               ShaderRegister: 1,
               RegisterSpace: 0,
-              Num32BitValues: 2
+              Num32BitValues: 3
             }
           }
         },
@@ -191,6 +199,7 @@ impl Renderer {
             }
           },
         }
+
       ];
 
       let root_signature_desc = D3D12_ROOT_SIGNATURE_DESC {
@@ -287,7 +296,8 @@ impl Renderer {
 
       let mut renderer = Renderer {
         dsv: dsv_heap.alloc(),
-        camera_cbuffer: BufferedBuffer::new(&device),
+        transform_pool: TransformPool::new(&device, &mut cbv_srv_uav_heap, 1024),
+        camera_cbuffer: BufferedBuffer::new(&device, 1),
         frame: 0,
         device,
         queue,
@@ -317,7 +327,7 @@ impl Renderer {
     }
   }
 
-  pub fn render(&mut self, meshes: &Vec<StaticMesh>, time: f32) {
+  pub fn render(&mut self, meshes: &Vec<(StaticMesh, Float4x4)>, time: f32) {
     unsafe{
       self.match_window_size();
 
@@ -370,19 +380,26 @@ impl Renderer {
 
       cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-      let cam_data = self.camera_cbuffer.get(self.frame);
       let camera_transform = matrix::translation(&[time.sin()*3.0, 0.0, time.cos()*3.0]) * matrix::rotation(&matrix::quaternion_roll_pitch_yaw(0.0, 0.0, time));
 
       let view_matrix = camera_transform.inverse().expect("Failed to inverse camera matrix");
       let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
       let proj_matrix = matrix::perspective_rh(3.1415 * 0.25, aspect, 0.1, 1000.0);
-      *cam_data = proj_matrix * view_matrix;
 
-      cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame));
+      let view_proj = proj_matrix * view_matrix;
+      self.camera_cbuffer.write(self.frame, 0, &view_proj);
 
-      for m in meshes {
+      cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame, 0));
+
+      self.transform_pool.reset();
+
+      for (m, transform) in meshes {
         cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.vbuffer_srv) as u32, 0); // Set vbuffer index
         cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.ibuffer_srv) as u32, 1); // Set ibuffer index
+
+        let transform_cbv = self.transform_pool.alloc(self.frame, transform);
+        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(transform_cbv) as u32, 2);
+
         cmd_list.DrawInstanced(m.index_count as u32, 1, 0, 0);
       }
 
@@ -673,9 +690,12 @@ fn make_buffer(device: &ID3D12Device, size: usize, heap_type: D3D12_HEAP_TYPE) -
   }
 }
 
+#[allow(unused)]
 struct BufferedBuffer<T> {
   resource: ID3D12Resource,
-  ptrs: [*mut T; FRAMES_IN_FLIGHT]
+  ptrs: [Vec<*mut T>; FRAMES_IN_FLIGHT],
+  base_virtual_addr: u64,
+  count: usize
 }
 
 impl<T> BufferedBuffer<T> {
@@ -684,29 +704,33 @@ impl<T> BufferedBuffer<T> {
     return (sz + 255) & !(255 as usize);
   }
 
-  fn new(device: &ID3D12Device) -> Self {
+  fn new(device: &ID3D12Device, count: usize) -> Self {
     unsafe {
-      let resource = make_buffer(device, Self::padded_size() * FRAMES_IN_FLIGHT, D3D12_HEAP_TYPE_UPLOAD);
+      let resource = make_buffer(device, Self::padded_size() * count * FRAMES_IN_FLIGHT, D3D12_HEAP_TYPE_UPLOAD);
 
       let mut void_ptr = std::ptr::null_mut::<std::ffi::c_void>();
       resource.Map(0, None, Some(&mut void_ptr)).expect("Failed to map buffer");
       let ptr_base = void_ptr as *mut T;
 
-      let ptrs = std::array::from_fn(|i|ptr_base.byte_add(i * Self::padded_size()));
+      let ptrs = std::array::from_fn(|frame|{
+        (0..count).map(|index|ptr_base.byte_add((frame*count+index) * Self::padded_size())).collect()
+      });
 
       return Self {
+        base_virtual_addr: resource.GetGPUVirtualAddress(),
         resource,
         ptrs,
+        count
       };
     }
   }
 
-  fn get(&self, frame: usize) -> &mut T {
-    return unsafe{&mut(*self.ptrs[frame])};
+  fn write(&self, frame: usize, index: usize, data: &T) {
+    unsafe{std::ptr::copy_nonoverlapping(data as _, self.ptrs[frame][index], 1)};
   }
 
-  fn gpu_virtual_address(&self, frame: usize) -> u64 {
-    return unsafe{self.resource.GetGPUVirtualAddress() + (frame * Self::padded_size()) as u64};
+  fn gpu_virtual_address(&self, frame: usize, index: usize) -> u64 {
+    return self.base_virtual_addr + ((frame*self.count+index) * Self::padded_size()) as u64;
   }
 }
 
@@ -776,3 +800,56 @@ impl StaticMesh {
       };
   }
 }
+
+struct TransformPool {
+  buffer: BufferedBuffer<Float4x4>,
+  cbvs: [Vec<DescriptorHandle>;FRAMES_IN_FLIGHT],
+  next: usize,
+  count: usize
+}
+
+impl TransformPool {
+  fn new(device: &ID3D12Device, cbv_srv_uav_heap: &mut DescriptorHeap, count: usize) -> Self {
+    let buffer = BufferedBuffer::new(&device, count);
+
+    let cbvs: [Vec<DescriptorHandle>;FRAMES_IN_FLIGHT] = std::array::from_fn(|_| {
+      (0..count).map(|_|cbv_srv_uav_heap.alloc()).collect()
+    });
+
+    for frame in 0..FRAMES_IN_FLIGHT {
+      for index in 0..count {
+        let cbv_desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+          BufferLocation: buffer.gpu_virtual_address(frame, index),
+          SizeInBytes: BufferedBuffer::<Float4x4>::padded_size() as u32,
+        };
+
+        unsafe{device.CreateConstantBufferView(Some(&cbv_desc), cbv_srv_uav_heap.cpu_handle(cbvs[frame][index]))};
+      }
+    }
+
+    return TransformPool {
+      buffer,
+      cbvs,
+      count,
+      next: 0
+    };
+  }
+
+  fn alloc(&mut self, frame: usize, transform: &Float4x4) -> DescriptorHandle {
+    if self.next == self.count {
+      panic!("out of transforms");
+    }
+
+    let idx = self.next;
+    self.next += 1;
+
+    self.buffer.write(frame, idx, transform);
+
+    return self.cbvs[frame][idx];
+  }
+
+  fn reset(&mut self) {
+    self.next = 0;
+  }
+}
+
