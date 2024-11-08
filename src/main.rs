@@ -3,11 +3,11 @@ mod renderer;
 mod matrix;
 mod json;
 mod gltf;
+mod base64;
 
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
 fn main() -> std::result::Result<(), String> {
-
     unsafe {
         let wc = WNDCLASSA {
             hInstance: GetModuleHandleA(None).unwrap().into(),
@@ -43,7 +43,7 @@ fn main() -> std::result::Result<(), String> {
 
         let mut renderer = renderer::Renderer::new(window)?;
 
-        let cpu_meshes = gltf::load("models/cube/scene.gltf")?;
+        let cpu_meshes = gltf::load("models/damaged_helmet_binary/scene.glb")?;
         let meshes = cpu_meshes.iter().map(|x|renderer::StaticMesh::new(&mut renderer, x)).collect();
 
         let start = std::time::Instant::now();

@@ -1,3 +1,4 @@
+use std::io::{Read, Seek};
 use std::result::Result;
 use std::collections::HashMap;
 use crate::*;
@@ -70,8 +71,30 @@ fn type_to_dims(str: &String) -> Option<usize> {
   return rest.parse().ok();
 }
 
-pub fn load(path: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
-  let dir= match std::path::Path::new(path).parent() {
+unsafe fn read_type<T>(buf: &mut std::io::BufReader<std::fs::File>) -> Option<T> {
+  let mut x: T = std::mem::zeroed();
+  let slice = std::slice::from_raw_parts_mut(&mut x as *mut T as *mut u8, std::mem::size_of::<T>());
+  buf.read_exact(slice).ok()?;
+  return Some(x);
+}
+
+#[repr(packed)]
+struct GLBHeader {
+  magic: u32,
+  version: u32,
+  length: u32
+}
+
+#[repr(packed)]
+struct ChunkHeader {
+  length: u32,
+  ty: u32
+}
+
+pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
+  let path = std::path::Path::new(path_str);
+
+  let dir= match path.parent() {
     Some(p) => {
       p.to_str().ok_or("no parent directory")?
     },
@@ -80,13 +103,83 @@ pub fn load(path: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
     }
   };
 
-  let gltf_text = std::fs::read_to_string(path).map_err(|_|"failed to load gltf file")?; 
+  let ext = match path.extension() {
+    Some(s) => {
+      s
+    }
+    None => {
+      return Err("cannot deduce file format without extension");
+    }
+  };
 
-  // Parse the JSON tree
+  let (root, buffers) = if ext == "gltf" {
+    let gltf_text = std::fs::read_to_string(path).map_err(|_|"failed to load gltf file")?; 
 
-  let root_n = json::parse(&gltf_text).map_err(|_|"gltf json could not be parsed")?;
-  let root = root_n.as_obj().ok_or("root not object")?;
+    let root_n = json::parse(&gltf_text).map_err(|_|"gltf json could not be parsed")?;
+    let root = root_n.as_obj().ok_or("root not object")?;
 
+    (root_n, None)
+  }
+  else {
+    let file = std::fs::File::open(path).map_err(|_|"failed to load glb file")?;
+    let mut buf = std::io::BufReader::new(file);
+
+    let header = unsafe {read_type::<GLBHeader>(&mut buf).ok_or("failed to read glb header")?};
+
+    if header.magic != 0x46546C67 {
+      return Err("unrecognized format");
+    }
+
+    if header.version != 2 {
+      return Err("unrecognized glb version");
+    }
+
+    const JSON_CHUNK: u32 = 0x4E4F534A;
+    const BIN_CHUNK: u32 = 0x004E4942;
+
+    let mut json_root = Option::<json::Node>::None;
+    let mut buffers = Vec::<Vec<u8>>::new();
+
+    while buf.stream_position().unwrap() < header.length as u64 {
+      let chunk_hdr = unsafe{read_type::<ChunkHeader>(&mut buf).ok_or("failed to read chunk header")?};
+
+      let mut bytes = vec![0 as u8;chunk_hdr.length as usize];
+      buf.read_exact(&mut bytes).map_err(|_|"failed to read chunk data")?;
+      
+      match chunk_hdr.ty {
+        JSON_CHUNK => {
+          if json_root.is_some() {
+            return Err("multiple json chunks in glb");
+          }
+
+          let json_string = String::from_utf8(bytes).map_err(|_|"json chunk failed to stringify")?;
+
+          json_root = Some(json::parse(&json_string).map_err(|_|"failed to parse json chunk")?);
+        }
+        BIN_CHUNK => {
+          buffers.push(bytes);
+        }
+        _ => {
+          return Err("unrecognized glb chunk type");
+        }
+      }
+    }
+
+    if json_root.is_none() {
+      return Err("no json chunk");
+    }
+
+    (json_root.unwrap(), Some(buffers))
+  };
+
+  return load_from_root(
+    root.as_obj().ok_or("root not object")?,
+    &buffers,
+    dir
+  );
+}
+
+pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Option<Vec<Vec<u8>>>, dir: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
   // Verify the version
 
   let asset = root.get("asset").ok_or("no asset")?.as_obj().ok_or("asset not object")?;
@@ -98,20 +191,36 @@ pub fn load(path: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
 
   // Load all buffers
 
-  let mut buffers = Vec::<Vec<u8>>::new();
-  
-  for b in root.get("buffers").ok_or("no buffers")?.as_array().ok_or("buffers not array")? {
-    let buf = b.as_obj().ok_or("buffer not object")?;
+  let mut external_buffers = Vec::<Vec<u8>>::new();
 
-    let _length = buf.get("byteLength").ok_or("no buffer byteLength")?.as_integer().ok_or("buffer byteLength not integer")?;
-    let uri = buf.get("uri").ok_or("no buffer uri")?.as_string().ok_or("buffer uri not string")?;
-
-    let buf_path = format!("{}/{}", dir, uri);
-
-    let data = std::fs::read(buf_path).map_err(|_|"failed to load buffer")?;
-    buffers.push(data);
+  let buffers = if let Some(buffers) = preloaded_buffers {
+    buffers
   }
+  else {
+    for b in root.get("buffers").ok_or("no buffers")?.as_array().ok_or("buffers not array")? {
+      let buf = b.as_obj().ok_or("buffer not object")?;
 
+      let _length = buf.get("byteLength").ok_or("no buffer byteLength")?.as_integer().ok_or("buffer byteLength not integer")?;
+      
+      let uri = buf.get("uri").ok_or("no buffer uri")?.as_string().ok_or("buffer uri not string")?;
+
+      let base64_prefix = "data:application/octet-stream;base64,";
+
+      let data = if uri.starts_with(base64_prefix) {
+        let chars: Vec<char> = uri.chars().collect();
+        base64::decode(&chars[base64_prefix.len()..]).ok_or("failed to decode base64 buffer")?
+      }
+      else {
+        let buf_path = format!("{}/{}", dir, uri);
+        std::fs::read(buf_path).map_err(|_|"failed to load buffer")?
+      };
+
+      external_buffers.push(data);
+    }
+
+    &external_buffers
+  };
+  
   // Gather buffer views
 
   let mut buffer_views = Vec::<BufferView>::new();
@@ -141,6 +250,10 @@ pub fn load(path: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
     let comp_type = acc.get("componentType").ok_or("no accessor component type")?.as_integer().ok_or("accessor component type not integer")?;
     let count = acc.get("count").ok_or("no accessor count")?.as_integer().ok_or("accessor count not integer")?;
     let ty = acc.get("type").ok_or("no accessor type")?.as_string().ok_or("accessor type not string")?;
+
+    if acc.contains_key("sparse") {
+      return Err("accessor contains sparse attribute which is not yet handled");
+    }
 
     let offset = match acc.get("byteOffset") {
       Some(off) => off.as_integer().ok_or("accessor offset not integer")?,
