@@ -6,6 +6,11 @@ mod json;
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
 fn main() -> std::result::Result<(), String> {
+    let text = std::fs::read_to_string("test.json").unwrap();
+
+    let tree = json::parse(&text)?;
+    println!("{:?}", tree);
+
     unsafe {
         let wc = WNDCLASSA {
             hInstance: GetModuleHandleA(None).unwrap().into(),
