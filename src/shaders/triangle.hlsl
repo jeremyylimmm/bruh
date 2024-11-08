@@ -6,7 +6,7 @@ struct Vertex {
 
 struct VSOut {
   float4 sv_pos : SV_Position;
-  float3 color : Color;
+  float3 norm : Normal;
 };
 
 cbuffer Camera : register(b0, space0) {
@@ -27,11 +27,12 @@ VSOut vs_main(uint vid : SV_VertexID) {
 
   VSOut vso;
   vso.sv_pos = mul(float4(vertex.pos, 1.0f), view_proj);
-  vso.color = vertex.norm;
+  vso.norm = normalize(vertex.norm);
 
   return vso;
 }
 
 float4 ps_main(VSOut vso) : SV_Target {
-  return float4(sqrt(vso.color), 1.0f);
+  float3 norm = normalize(vso.norm);
+  return float4(sqrt(norm * 0.5f + 0.5f), 1.0f);
 }

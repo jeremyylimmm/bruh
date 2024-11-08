@@ -5,7 +5,7 @@ use std::result::Result;
 #[derive(Debug)]
 pub enum Node {
   Null,
-  Integer(u64),
+  Integer(i64),
   Real(f64),
   String(String),
   Boolean(bool),
@@ -45,6 +45,58 @@ struct Parser {
   line: usize,
   cur: usize,
   cache: Option<Token>,
+}
+
+#[allow(unused)]
+impl Node {
+  pub fn is_null(&self) -> bool {
+    return match self {
+      Node::Null => true,
+      _ => false,
+    };
+  }
+
+  pub fn as_integer(&self) -> Option<i64> {
+    return match self {
+      Node::Integer(i) => Some(*i),
+      _ => None
+    };
+  }
+
+  pub fn as_real(&self) -> Option<f64> {
+    return match self {
+      Node::Real(f) => Some(*f),
+      _ => None
+    };
+  }
+
+  pub fn as_bool(&self) -> Option<bool> {
+    return match self {
+      Node::Boolean(b) => Some(*b),
+      _ => None
+    }
+  }
+
+  pub fn as_string<'a>(&'a self) -> Option<&'a String> {
+    return match self {
+      Node::String(s) => Some(s),
+      _ => None
+    }
+  }
+
+  pub fn as_array<'a>(&'a self) -> Option<&'a Vec<Node>> {
+    return match self {
+      Node::Array(a) => Some(a),
+      _ => None
+    }
+  }
+
+  pub fn as_obj<'a>(&'a self) -> Option<&'a HashMap<String, Node>> {
+    return match self {
+      Node::Object(m) => Some(m),
+      _ => None
+    }
+  }
 }
 
 impl Parser {

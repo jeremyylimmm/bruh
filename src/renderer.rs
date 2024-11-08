@@ -27,15 +27,13 @@ pub struct Renderer {
   root_signature: ID3D12RootSignature,
   pipeline: ID3D12PipelineState,
   camera_cbuffer: BufferedBuffer<matrix::Float4x4>,
-
-  mesh: StaticMesh
 }
 
 #[repr(C)]
-struct Vertex {
-  pos: [f32;3],
-  norm: [f32;3],
-  tex_coord: [f32;2],
+pub struct Vertex {
+  pub pos: [f32;3],
+  pub norm: [f32;3],
+  pub tex_coord: [f32;2],
 }
 
 impl Renderer {
@@ -133,7 +131,7 @@ impl Renderer {
       };
 
       let mut rtv_heap=DescriptorHeap::new(&device, 1024, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
-      let mut cbv_srv_uav_heap = DescriptorHeap::new(&device, 1000000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+      let cbv_srv_uav_heap = DescriptorHeap::new(&device, 1000000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
 
       let rtvs: [DescriptorHandle;DXGI_MAX_SWAP_CHAIN_BUFFERS as _] = std::array::from_fn(|_|rtv_heap.alloc());
 
@@ -281,35 +279,6 @@ impl Renderer {
 
       let pipeline = device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed t create pipeline")?;
 
-      let vertex_data = vec![
-        Vertex {
-          pos: [-0.5, -0.5, 0.0],
-          norm: [0.0, 1.0, 0.0],
-          tex_coord: [0.0, 0.0]
-        },
-        Vertex {
-          pos: [ 0.5, -0.5, 0.0],
-          norm: [0.0, 1.0, 0.0],
-          tex_coord: [0.0, 0.0]
-        },
-        Vertex {
-          pos: [ 0.5,  0.5, 0.0],
-          norm: [0.0, 1.0, 0.0],
-          tex_coord: [0.0, 0.0]
-        },
-        Vertex {
-          pos: [-0.5,  0.5, 0.0],
-          norm: [0.0, 1.0, 0.0],
-          tex_coord: [0.0, 0.0]
-        },
-      ];
-
-      let index_data= vec![
-        0 as u32, 2, 3, 1, 2, 0
-      ];
-
-      let mesh = StaticMesh::new(&device, &mut cbv_srv_uav_heap, &vertex_data, &index_data);
-
       let mut renderer = Renderer {
         camera_cbuffer: BufferedBuffer::new(&device),
         frame: 0,
@@ -331,7 +300,6 @@ impl Renderer {
         cbv_srv_uav_heap,
         root_signature,
         pipeline,
-        mesh
       };
 
       renderer.init_swapchain_resources();
@@ -340,7 +308,7 @@ impl Renderer {
     }
   }
 
-  pub fn render(&mut self, time: f32) {
+  pub fn render(&mut self, meshes: &Vec<StaticMesh>, time: f32) {
     unsafe{
       self.match_window_size();
 
@@ -387,7 +355,7 @@ impl Renderer {
       cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
       let cam_data = self.camera_cbuffer.get(self.frame);
-      let camera_transform = matrix::translation(&[time.sin()*3.0, 0.0, time.cos()*3.0]) * matrix::rotation(&matrix::quaternion_roll_pitch_yaw(0.0, 0.0, time));
+      let camera_transform = matrix::translation(&[time.sin()*6.0, 0.0, time.cos()*6.0]) * matrix::rotation(&matrix::quaternion_roll_pitch_yaw(0.0, 0.0, time));
 
       let view_matrix = camera_transform.inverse().expect("Failed to inverse camera matrix");
       let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
@@ -396,9 +364,11 @@ impl Renderer {
 
       cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame));
 
-      cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(self.mesh.vbuffer_srv) as u32, 0); // Set vbuffer index
-      cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(self.mesh.ibuffer_srv) as u32, 1); // Set ibuffer index
-      cmd_list.DrawInstanced(self.mesh.index_count as u32, 1, 0, 0);
+      for m in meshes {
+        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.vbuffer_srv) as u32, 0); // Set vbuffer index
+        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.ibuffer_srv) as u32, 1); // Set ibuffer index
+        cmd_list.DrawInstanced(m.index_count as u32, 1, 0, 0);
+      }
 
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
 
@@ -695,7 +665,7 @@ fn structured_buffer_srv_desc<T>(num_elements: usize) -> D3D12_SHADER_RESOURCE_V
 }
 
 #[allow(unused)]
-struct StaticMesh {
+pub struct StaticMesh {
   vbuffer: ID3D12Resource,
   ibuffer: ID3D12Resource,
 
@@ -705,29 +675,34 @@ struct StaticMesh {
   index_count: usize,
 }
 
+pub struct CPUStaticMesh {
+  pub vertex_data: Vec<Vertex>,
+  pub index_data: Vec<u32>
+}
+
 impl StaticMesh {
-  pub fn new(device: &ID3D12Device, cbv_srv_uav_heap: &mut DescriptorHeap, vertex_data: &Vec<Vertex>, index_data: &Vec<u32>) -> StaticMesh {
-      let vbuffer = make_buffer(&device, vertex_data.len() * std::mem::size_of::<Vertex>(), D3D12_HEAP_TYPE_UPLOAD);
-      let ibuffer = make_buffer(&device, index_data.len() * std::mem::size_of::<u32>(), D3D12_HEAP_TYPE_UPLOAD);
+  pub fn new(renderer: &mut Renderer, cpu_mesh: &CPUStaticMesh) -> StaticMesh {
+      let vbuffer = make_buffer(&renderer.device, cpu_mesh.vertex_data.len() * std::mem::size_of::<Vertex>(), D3D12_HEAP_TYPE_UPLOAD);
+      let ibuffer = make_buffer(&renderer.device, cpu_mesh.index_data.len() * std::mem::size_of::<u32>(), D3D12_HEAP_TYPE_UPLOAD);
 
       unsafe {
         let mut ptr = std::ptr::null_mut::<std::ffi::c_void>();
 
         vbuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
-        std::ptr::copy_nonoverlapping(vertex_data.as_ptr(), ptr as _, vertex_data.len());
+        std::ptr::copy_nonoverlapping(cpu_mesh.vertex_data.as_ptr(), ptr as _, cpu_mesh.vertex_data.len());
         vbuffer.Unmap(0, None);
 
         ibuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
-        std::ptr::copy_nonoverlapping(index_data.as_ptr(), ptr as _, index_data.len());
+        std::ptr::copy_nonoverlapping(cpu_mesh.index_data.as_ptr(), ptr as _, cpu_mesh.index_data.len());
         ibuffer.Unmap(0, None);
       }
 
-      let vbuffer_srv = cbv_srv_uav_heap.alloc();
-      let ibuffer_srv = cbv_srv_uav_heap.alloc();
+      let vbuffer_srv = renderer.cbv_srv_uav_heap.alloc();
+      let ibuffer_srv = renderer.cbv_srv_uav_heap.alloc();
 
       unsafe {
-        device.CreateShaderResourceView(&vbuffer, Some(&structured_buffer_srv_desc::<Vertex>(vertex_data.len())), cbv_srv_uav_heap.cpu_handle(vbuffer_srv));
-        device.CreateShaderResourceView(&ibuffer, Some(&structured_buffer_srv_desc::<u32>(index_data.len())), cbv_srv_uav_heap.cpu_handle(ibuffer_srv));
+        renderer.device.CreateShaderResourceView(&vbuffer, Some(&structured_buffer_srv_desc::<Vertex>(cpu_mesh.vertex_data.len())), renderer.cbv_srv_uav_heap.cpu_handle(vbuffer_srv));
+        renderer.device.CreateShaderResourceView(&ibuffer, Some(&structured_buffer_srv_desc::<u32>(cpu_mesh.index_data.len())), renderer.cbv_srv_uav_heap.cpu_handle(ibuffer_srv));
       }
 
       return StaticMesh {
@@ -735,7 +710,7 @@ impl StaticMesh {
         ibuffer,
         vbuffer_srv,
         ibuffer_srv,
-        index_count: index_data.len()
+        index_count: cpu_mesh.index_data.len()
       };
   }
 }

@@ -2,14 +2,11 @@ mod renderer;
 #[allow(unused)]
 mod matrix;
 mod json;
+mod gltf;
 
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
 fn main() -> std::result::Result<(), String> {
-    let text = std::fs::read_to_string("test.json").unwrap();
-
-    let tree = json::parse(&text)?;
-    println!("{:?}", tree);
 
     unsafe {
         let wc = WNDCLASSA {
@@ -46,6 +43,9 @@ fn main() -> std::result::Result<(), String> {
 
         let mut renderer = renderer::Renderer::new(window)?;
 
+        let cpu_meshes = gltf::load("models/cube/scene.gltf")?;
+        let meshes = cpu_meshes.iter().map(|x|renderer::StaticMesh::new(&mut renderer, x)).collect();
+
         let start = std::time::Instant::now();
 
         loop {
@@ -60,7 +60,7 @@ fn main() -> std::result::Result<(), String> {
                 break;
             }
 
-            renderer.render(start.elapsed().as_secs_f32());
+            renderer.render(&meshes, start.elapsed().as_secs_f32());
         }
 
         return Ok(());
