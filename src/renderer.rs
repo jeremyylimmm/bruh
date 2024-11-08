@@ -24,9 +24,12 @@ pub struct Renderer {
   window: HWND,
   rtv_heap: DescriptorHeap,
   cbv_srv_uav_heap: DescriptorHeap,
+  dsv_heap: DescriptorHeap,
   root_signature: ID3D12RootSignature,
   pipeline: ID3D12PipelineState,
   camera_cbuffer: BufferedBuffer<matrix::Float4x4>,
+  depth_buffer: Option<ID3D12Resource>,
+  dsv: DescriptorHandle,
 }
 
 #[repr(C)]
@@ -132,6 +135,7 @@ impl Renderer {
 
       let mut rtv_heap=DescriptorHeap::new(&device, 1024, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
       let cbv_srv_uav_heap = DescriptorHeap::new(&device, 1000000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+      let mut dsv_heap = DescriptorHeap::new(&device, 1024, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
 
       let rtvs: [DescriptorHandle;DXGI_MAX_SWAP_CHAIN_BUFFERS as _] = std::array::from_fn(|_|rtv_heap.alloc());
 
@@ -241,7 +245,7 @@ impl Renderer {
         },
 
         DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
-          DepthEnable:	FALSE,
+          DepthEnable:	TRUE,
           DepthWriteMask:	D3D12_DEPTH_WRITE_MASK_ALL,
           DepthFunc:	D3D12_COMPARISON_FUNC_LESS,
           StencilEnable: FALSE,
@@ -271,6 +275,8 @@ impl Renderer {
           Count: 1,
           Quality: 0
         },
+
+        DSVFormat: DXGI_FORMAT_D32_FLOAT,
         
         ..Default::default()
       };
@@ -280,6 +286,7 @@ impl Renderer {
       let pipeline = device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed t create pipeline")?;
 
       let mut renderer = Renderer {
+        dsv: dsv_heap.alloc(),
         camera_cbuffer: BufferedBuffer::new(&device),
         frame: 0,
         device,
@@ -298,8 +305,10 @@ impl Renderer {
         window,
         rtv_heap,
         cbv_srv_uav_heap,
+        dsv_heap,
         root_signature,
         pipeline,
+        depth_buffer: None,
       };
 
       renderer.init_swapchain_resources();
@@ -326,8 +335,15 @@ impl Renderer {
 
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
 
-      cmd_list.ClearRenderTargetView(self.swapchain_rtvs[swapchain_index], &[0.2, 0.3, 0.3, 1.0], None); 
-      cmd_list.OMSetRenderTargets(1, Some(&self.swapchain_rtvs[swapchain_index]), None, None);
+      let clear_rect = RECT {
+        right: self.swapchain_w as i32,
+        bottom: self.swapchain_h as i32,
+        ..Default::default()
+      };
+
+      cmd_list.ClearDepthStencilView(self.dsv_heap.cpu_handle(self.dsv), D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[clear_rect]);
+      cmd_list.ClearRenderTargetView(self.swapchain_rtvs[swapchain_index], &[0.1, 0.1, 0.1, 1.0], None); 
+      cmd_list.OMSetRenderTargets(1, Some(&self.swapchain_rtvs[swapchain_index]), None, Some(&self.dsv_heap.cpu_handle(self.dsv)));
 
       cmd_list.SetGraphicsRootSignature(&self.root_signature);
       cmd_list.SetPipelineState(&self.pipeline);
@@ -355,7 +371,7 @@ impl Renderer {
       cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
       let cam_data = self.camera_cbuffer.get(self.frame);
-      let camera_transform = matrix::translation(&[time.sin()*6.0, 0.0, time.cos()*6.0]) * matrix::rotation(&matrix::quaternion_roll_pitch_yaw(0.0, 0.0, time));
+      let camera_transform = matrix::translation(&[time.sin()*3.0, 0.0, time.cos()*3.0]) * matrix::rotation(&matrix::quaternion_roll_pitch_yaw(0.0, 0.0, time));
 
       let view_matrix = camera_transform.inverse().expect("Failed to inverse camera matrix");
       let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
@@ -427,6 +443,52 @@ impl Renderer {
 
         self.device.CreateRenderTargetView(&self.swapchain_buffers[i as usize], Some(&rtv_desc), self.swapchain_rtvs[i as usize]);
       }
+
+      let depth_buffer_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: self.swapchain_w as u64,
+        Height: self.swapchain_h,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        SampleDesc: DXGI_SAMPLE_DESC {
+          Count: 1,
+          Quality: 0
+        },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        ..Default::default()
+      };
+
+      let dsv_desc = D3D12_DEPTH_STENCIL_VIEW_DESC {
+        Format: DXGI_FORMAT_D32_FLOAT,
+        ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+          Texture2D: D3D12_TEX2D_DSV {
+            MipSlice: 0
+          }
+        },
+        ..Default::default()
+      };
+
+      let clear_value = D3D12_CLEAR_VALUE {
+        Format: dsv_desc.Format,
+        Anonymous: D3D12_CLEAR_VALUE_0 {
+          DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
+            Depth: 1.0,
+            Stencil: 0
+          }
+        }
+      };
+
+      let heap_props = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+      };
+
+      self.depth_buffer = None;
+      self.device.CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &depth_buffer_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, Some(&clear_value), &mut self.depth_buffer).unwrap();
+
+      self.device.CreateDepthStencilView(self.depth_buffer.as_ref().unwrap(), Some(&dsv_desc), self.dsv_heap.cpu_handle(self.dsv));
     }
   }
 

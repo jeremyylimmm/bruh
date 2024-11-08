@@ -216,16 +216,30 @@ impl Parser {
           self.eatc();
         }
 
-        let is_real = if self.peekc() == '.' {
-          self.eatc();
-          true
-        }
-        else {
-          false
-        };
+        let mut is_real = false;
 
-        while self.peekc().is_digit(10) {
+        if self.peekc() == '.' {
           self.eatc();
+
+          while self.peekc().is_digit(10) {
+            self.eatc();
+          }
+
+          is_real = true;
+        }
+
+        if self.peekc().to_ascii_lowercase() == 'e' {
+          self.eatc();
+
+          if self.peekc() == '-' {
+            self.eatc();
+          }
+
+          while self.peekc().is_digit(10) {
+            self.eatc();
+          }
+
+          is_real = true;
         }
 
         if is_real { TokenKind::Real } else { TokenKind::Integer }

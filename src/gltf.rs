@@ -47,7 +47,7 @@ struct Node<'a> {
 
 #[derive(Debug)]
 struct Scene<'a> {
-  name: &'a String,
+  name: &'a str,
   nodes: Vec<usize>
 }
 
@@ -112,13 +112,9 @@ pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str
     }
   };
 
-  let (root, buffers) = if ext == "gltf" {
+  let (json_text, buffers) = if ext == "gltf" {
     let gltf_text = std::fs::read_to_string(path).map_err(|_|"failed to load gltf file")?; 
-
-    let root_n = json::parse(&gltf_text).map_err(|_|"gltf json could not be parsed")?;
-    let root = root_n.as_obj().ok_or("root not object")?;
-
-    (root_n, None)
+    (gltf_text, None)
   }
   else {
     let file = std::fs::File::open(path).map_err(|_|"failed to load glb file")?;
@@ -137,7 +133,7 @@ pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str
     const JSON_CHUNK: u32 = 0x4E4F534A;
     const BIN_CHUNK: u32 = 0x004E4942;
 
-    let mut json_root = Option::<json::Node>::None;
+    let mut json_text = Option::<String>::None;
     let mut buffers = Vec::<Vec<u8>>::new();
 
     while buf.stream_position().unwrap() < header.length as u64 {
@@ -148,13 +144,11 @@ pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str
       
       match chunk_hdr.ty {
         JSON_CHUNK => {
-          if json_root.is_some() {
+          if json_text.is_some() {
             return Err("multiple json chunks in glb");
           }
 
-          let json_string = String::from_utf8(bytes).map_err(|_|"json chunk failed to stringify")?;
-
-          json_root = Some(json::parse(&json_string).map_err(|_|"failed to parse json chunk")?);
+          json_text = Some(String::from_utf8(bytes).map_err(|_|"json chunk failed to stringify")?);
         }
         BIN_CHUNK => {
           buffers.push(bytes);
@@ -165,11 +159,18 @@ pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str
       }
     }
 
-    if json_root.is_none() {
+    if json_text.is_none() {
       return Err("no json chunk");
     }
 
-    (json_root.unwrap(), Some(buffers))
+    (json_text.unwrap(), Some(buffers))
+  };
+
+  let root = match json::parse(&json_text) {
+    Ok(root) => root,
+    Err(_msg) => {
+      return Err("failed to parse gltf json:");
+    }
   };
 
   return load_from_root(
@@ -230,7 +231,13 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
 
     let buf = buf_view.get("buffer").ok_or("no buffer")?.as_integer().ok_or("buffer view buffer not integer")?;
     let length = buf_view.get("byteLength").ok_or("no buffer view length")?.as_integer().ok_or("buffer view length not integer")?;
-    let offset = buf_view.get("byteOffset").ok_or("no buffer view offset")?.as_integer().ok_or("buffer view offset not integer")?;
+
+    let offset = if let Some(off) = buf_view.get("byteOffset") {
+      off.as_integer().ok_or("buffer view offset not integer")?
+    }
+    else {
+      0
+    };
 
     buffer_views.push(BufferView{
       buffer: buf as usize,
@@ -331,7 +338,13 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
   for s in root.get("scenes").ok_or("no scenes")?.as_array().ok_or("scenes not array")? {
     let scene = s.as_obj().ok_or("scene not object")?;
 
-    let name = scene.get("name").ok_or("no scene name")?.as_string().ok_or("scene name not string")?;
+    let name = if let Some(n) = scene.get("name") {
+      n.as_string().ok_or("scene name not string")?.as_str()
+    }
+    else {
+      "unnamed"
+    };
+
     let mut nds = Vec::<usize>::new();
 
     for n in scene.get("nodes").ok_or("no scene nodes")?.as_array().ok_or("scene nodes not array")? {

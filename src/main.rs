@@ -43,7 +43,7 @@ fn main() -> std::result::Result<(), String> {
 
         let mut renderer = renderer::Renderer::new(window)?;
 
-        let cpu_meshes = gltf::load("models/damaged_helmet_binary/scene.glb")?;
+        let cpu_meshes = gltf::load("models/flight_helmet/scene.gltf")?;
         let meshes = cpu_meshes.iter().map(|x|renderer::StaticMesh::new(&mut renderer, x)).collect();
 
         let start = std::time::Instant::now();
