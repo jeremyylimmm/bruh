@@ -46,7 +46,7 @@ fn main() -> std::result::Result<(), String> {
         let cpu_meshes = gltf::load("models/flight_helmet/scene.gltf")?;
         let meshes = cpu_meshes.iter().map(|x|{
             (
-                renderer::StaticMesh::new(&mut renderer, x),
+                renderer.new_static_mesh(x),
                 matrix::translation(&[0.0, -1.0, 0.0]) * matrix::scaling(&[2.0, 2.0, 2.0])
             )
         }).collect();

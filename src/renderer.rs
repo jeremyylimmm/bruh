@@ -31,6 +31,30 @@ pub struct Renderer {
   depth_buffer: Option<ID3D12Resource>,
   dsv: DescriptorHandle,
   transform_pool: TransformPool,
+  static_mesh_pool: HandledPool<StaticMeshData, StaticMesh>
+}
+
+#[derive(Copy, Clone)]
+pub struct StaticMesh {
+  index: u32,
+  generation: u32
+}
+
+impl HandledPoolHandle for StaticMesh {
+  fn generation(&self) -> u32 {
+    return self.generation;
+  }
+
+  fn index(&self) -> usize {
+    return self.index as _;
+  }
+
+  fn make(index: u32, generation: u32) -> Self {
+    return Self {
+      index,
+      generation
+    };
+  }
 }
 
 #[repr(C)]
@@ -319,6 +343,7 @@ impl Renderer {
         root_signature,
         pipeline,
         depth_buffer: None,
+        static_mesh_pool: HandledPool::<StaticMeshData, StaticMesh>::new()
       };
 
       renderer.init_swapchain_resources();
@@ -393,7 +418,9 @@ impl Renderer {
 
       self.transform_pool.reset();
 
-      for (m, transform) in meshes {
+      for (mesh_handle, transform) in meshes {
+        let m = self.static_mesh_pool.get(*mesh_handle);
+
         cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.vbuffer_srv) as u32, 0); // Set vbuffer index
         cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.ibuffer_srv) as u32, 1); // Set ibuffer index
 
@@ -440,6 +467,41 @@ impl Renderer {
       self.swapchain_w = ww;
       self.swapchain_h = wh;
     }
+  }
+
+  pub fn new_static_mesh(&mut self, cpu_mesh: &CPUStaticMesh) -> StaticMesh {
+      let vbuffer = make_buffer(&self.device, cpu_mesh.vertex_data.len() * std::mem::size_of::<Vertex>(), D3D12_HEAP_TYPE_UPLOAD);
+      let ibuffer = make_buffer(&self.device, cpu_mesh.index_data.len() * std::mem::size_of::<u32>(), D3D12_HEAP_TYPE_UPLOAD);
+
+      unsafe {
+        let mut ptr = std::ptr::null_mut::<std::ffi::c_void>();
+
+        vbuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
+        std::ptr::copy_nonoverlapping(cpu_mesh.vertex_data.as_ptr(), ptr as _, cpu_mesh.vertex_data.len());
+        vbuffer.Unmap(0, None);
+
+        ibuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
+        std::ptr::copy_nonoverlapping(cpu_mesh.index_data.as_ptr(), ptr as _, cpu_mesh.index_data.len());
+        ibuffer.Unmap(0, None);
+      }
+
+      let vbuffer_srv = self.cbv_srv_uav_heap.alloc();
+      let ibuffer_srv = self.cbv_srv_uav_heap.alloc();
+
+      unsafe {
+        self.device.CreateShaderResourceView(&vbuffer, Some(&structured_buffer_srv_desc::<Vertex>(cpu_mesh.vertex_data.len())), self.cbv_srv_uav_heap.cpu_handle(vbuffer_srv));
+        self.device.CreateShaderResourceView(&ibuffer, Some(&structured_buffer_srv_desc::<u32>(cpu_mesh.index_data.len())), self.cbv_srv_uav_heap.cpu_handle(ibuffer_srv));
+      }
+
+      let data = StaticMeshData {
+        vbuffer,
+        ibuffer,
+        vbuffer_srv,
+        ibuffer_srv,
+        index_count: cpu_mesh.index_data.len()
+      };
+
+      return self.static_mesh_pool.alloc(data);
   }
 
   fn init_swapchain_resources(&mut self) {
@@ -751,7 +813,7 @@ fn structured_buffer_srv_desc<T>(num_elements: usize) -> D3D12_SHADER_RESOURCE_V
 }
 
 #[allow(unused)]
-pub struct StaticMesh {
+struct StaticMeshData {
   vbuffer: ID3D12Resource,
   ibuffer: ID3D12Resource,
 
@@ -766,38 +828,58 @@ pub struct CPUStaticMesh {
   pub index_data: Vec<u32>
 }
 
-impl StaticMesh {
-  pub fn new(renderer: &mut Renderer, cpu_mesh: &CPUStaticMesh) -> StaticMesh {
-      let vbuffer = make_buffer(&renderer.device, cpu_mesh.vertex_data.len() * std::mem::size_of::<Vertex>(), D3D12_HEAP_TYPE_UPLOAD);
-      let ibuffer = make_buffer(&renderer.device, cpu_mesh.index_data.len() * std::mem::size_of::<u32>(), D3D12_HEAP_TYPE_UPLOAD);
+trait HandledPoolHandle {
+  fn generation(&self) -> u32;
+  fn index(&self) -> usize;
+  fn make(index: u32, generation: u32) -> Self;
+}
 
-      unsafe {
-        let mut ptr = std::ptr::null_mut::<std::ffi::c_void>();
+struct HandledPool<T, H: HandledPoolHandle> {
+  data: Vec<Option<T>>,
+  generation: Vec<u32>,
+  free_list: Vec<usize>,
+  phantom: std::marker::PhantomData<H>
+}
 
-        vbuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
-        std::ptr::copy_nonoverlapping(cpu_mesh.vertex_data.as_ptr(), ptr as _, cpu_mesh.vertex_data.len());
-        vbuffer.Unmap(0, None);
+impl<T, H: HandledPoolHandle> HandledPool<T, H> {
+  fn new() -> Self {
+    return HandledPool {
+      data: Vec::new(),
+      generation: Vec::new(),
+      free_list: Vec::new(),
+      phantom: std::marker::PhantomData::default()
+    }
+  }
 
-        ibuffer.Map(0, None, Some(&mut ptr)).expect("Failed to map buffer");
-        std::ptr::copy_nonoverlapping(cpu_mesh.index_data.as_ptr(), ptr as _, cpu_mesh.index_data.len());
-        ibuffer.Unmap(0, None);
-      }
+  fn alloc(&mut self, data: T) -> H {
+    if self.free_list.is_empty() {
+      self.free_list.push(self.data.len());
+      self.data.push(Some(data));
+      self.generation.push(1);
+    }
 
-      let vbuffer_srv = renderer.cbv_srv_uav_heap.alloc();
-      let ibuffer_srv = renderer.cbv_srv_uav_heap.alloc();
+    let index = self.free_list.pop().unwrap();
+    let generation = self.generation[index];
 
-      unsafe {
-        renderer.device.CreateShaderResourceView(&vbuffer, Some(&structured_buffer_srv_desc::<Vertex>(cpu_mesh.vertex_data.len())), renderer.cbv_srv_uav_heap.cpu_handle(vbuffer_srv));
-        renderer.device.CreateShaderResourceView(&ibuffer, Some(&structured_buffer_srv_desc::<u32>(cpu_mesh.index_data.len())), renderer.cbv_srv_uav_heap.cpu_handle(ibuffer_srv));
-      }
+    return H::make(index as u32, generation);
+  }
 
-      return StaticMesh {
-        vbuffer,
-        ibuffer,
-        vbuffer_srv,
-        ibuffer_srv,
-        index_count: cpu_mesh.index_data.len()
-      };
+  fn verify_handle(&self, handle: H) -> usize {
+    std::assert!(handle.index() < self.data.len());
+    std::assert!(handle.generation() == self.generation[handle.index()]);
+    return handle.index();
+  }
+
+  fn free(&mut self, handle: H) {
+    let idx = self.verify_handle(handle);
+    self.generation[idx] += 1;
+    self.data[idx] = None;
+    self.free_list.push(idx);
+  }
+
+  fn get(&mut self, handle: H) -> &mut T {
+    let idx = self.verify_handle(handle);
+    return self.data[idx].as_mut().unwrap();
   }
 }
 
