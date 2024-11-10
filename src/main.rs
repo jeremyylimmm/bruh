@@ -4,10 +4,17 @@ mod matrix;
 mod json;
 mod gltf;
 mod base64;
+mod ecs;
 
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*};
 
+struct StaticMeshComponent {
+    mesh: renderer::StaticMesh
+}
+
 fn main() -> std::result::Result<(), String> {
+    let mut world = ecs::World::new();
+
     unsafe {
         let wc = WNDCLASSA {
             hInstance: GetModuleHandleA(None).unwrap().into(),
@@ -43,15 +50,17 @@ fn main() -> std::result::Result<(), String> {
 
         let mut renderer = renderer::Renderer::new(window)?;
 
-        let cpu_meshes = gltf::load("models/flight_helmet/scene.gltf")?;
-        let meshes = cpu_meshes.iter().map(|x|{
-            (
-                renderer.new_static_mesh(x),
-                matrix::translation(&[0.0, -1.0, 0.0]) * matrix::scaling(&[2.0, 2.0, 2.0])
-            )
-        }).collect();
+        for cpu_mesh in gltf::load("models/flight_helmet/scene.gltf")? {
+            let e = world.create_entity();
+
+            world.add(e, StaticMeshComponent{
+                mesh: renderer.new_static_mesh(&cpu_mesh)
+            });
+        }
 
         let start = std::time::Instant::now();
+
+        let mut render_queue = Vec::new();
 
         loop {
             let mut msg = MSG::default();
@@ -65,7 +74,14 @@ fn main() -> std::result::Result<(), String> {
                 break;
             }
 
-            renderer.render(&meshes, start.elapsed().as_secs_f32());
+            render_queue.clear();
+
+            for (mesh_comp, _) in world.view::<StaticMeshComponent>() {
+                let transform = matrix::translation(&[0.0, -1.0, 0.0]) * matrix::scaling(&[2.0, 2.0, 2.0]);
+                render_queue.push((mesh_comp.mesh, transform));
+            }
+
+            renderer.render(&render_queue, start.elapsed().as_secs_f32());
         }
 
         return Ok(());
