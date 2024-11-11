@@ -95,10 +95,8 @@ fn main() -> std::result::Result<(), String> {
       
       render_queue.clear();
       
-      for e in &ents {
-        let mesh_comp = world.get::<StaticMeshComponent>(*e).unwrap();
-        let transform_comp = world.get::<TransformComponent>(*e).unwrap();
-        render_queue.push((mesh_comp.mesh, transform_comp.matrix));
+      for (m, t, _) in world.view::<(StaticMeshComponent, TransformComponent)>() {
+        render_queue.push((m.mesh, t.matrix));
       }
       
       renderer.render(&render_queue, start.elapsed().as_secs_f32());

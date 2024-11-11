@@ -102,6 +102,10 @@ impl World {
   pub fn get_mut<T: 'static + Component>(&mut self, e: Entity) -> Option<&mut T> {
     return self.get_storage_mut().get_mut(e);
   }
+
+  pub fn view<'a, T: 'static + ComponentTuple<'a>>(&'a self) -> T::IterType {
+    return T::begin(self);
+  }
 }
 
 trait GenericComponentStorage {
@@ -111,7 +115,8 @@ trait GenericComponentStorage {
 }
 
 struct ComponentStorage<T: Component> {
-  packed: Vec<(T, Entity)>,
+  entities: Vec<Entity>,
+  data: Vec<T>,
   sparse: Vec<usize>
 }
 
@@ -119,8 +124,13 @@ impl<T: Component> ComponentStorage<T> {
   fn new() -> Self {
     return Self {
       sparse: Vec::new(),
-      packed: Vec::new()
+      entities: Vec::new(),
+      data: Vec::new()
     }
+  }
+
+  fn num_entities(&self) -> usize {
+    return self.entities.len();
   }
 
   fn add(&mut self, e: Entity, x: T) {
@@ -129,11 +139,14 @@ impl<T: Component> ComponentStorage<T> {
     }
 
     if self.sparse[e.index()] == usize::MAX {
-      self.sparse[e.index()] = self.packed.len();
-      self.packed.push((x, e));
+      self.sparse[e.index()] = self.entities.len();
+      self.entities.push(e);
+      self.data.push(x);
     }
     else {
-      self.packed[self.sparse[e.index()]] = (x, e);
+      let idx = self.sparse[e.index()];
+      self.entities[idx] = e;
+      self.data[idx] = x;
     }
   }
 
@@ -141,7 +154,7 @@ impl<T: Component> ComponentStorage<T> {
     if e.index() < self.sparse.len() {
       let i = self.sparse[e.index()];
       if i != usize::MAX {
-        return self.packed.get(i).map(|(x, _)|x);
+        return self.data.get(i);
       }
     }
 
@@ -152,7 +165,7 @@ impl<T: Component> ComponentStorage<T> {
     if e.index() < self.sparse.len() {
       let i = self.sparse[e.index()];
       if i != usize::MAX {
-        return self.packed.get_mut(i).map(|(x, _)|x);
+        return self.data.get_mut(i);
       }
     }
 
@@ -167,12 +180,14 @@ impl<T: Component> ComponentStorage<T> {
 impl<T: 'static + Component> GenericComponentStorage for ComponentStorage<T> {
   fn remove(&mut self, e: Entity) {
     if self.has(e) {
-      let last = self.packed.pop().unwrap();
+      let last_entity = self.entities.pop().unwrap();
+      let last_comp = self.data.pop().unwrap();
 
-      if last.1 != e {
+      if last_entity != e {
         let idx = self.sparse[e.index()];
-        self.sparse[last.1.index()] = idx;
-        self.packed[idx] = last;
+        self.sparse[last_entity.index()] = idx;
+        self.entities[idx] = last_entity;
+        self.data[idx] = last_comp;
       }
 
       self.sparse[e.index()] = usize::MAX;
@@ -185,5 +200,88 @@ impl<T: 'static + Component> GenericComponentStorage for ComponentStorage<T> {
 
   fn as_any_mut(&mut self) -> &mut dyn Any {
     return self;
+  }
+}
+
+pub struct SingleComponentIterator<'a, T: Component> {
+  entity: std::slice::Iter<'a, Entity>,
+  data: std::slice::Iter<'a, T>
+}
+
+pub struct DoubleComponentIterator<'a, A: Component, B: Component> {
+  entity: std::slice::Iter<'a, Entity>,
+  a: &'a ComponentStorage<A>,
+  b: &'a ComponentStorage<B>
+}
+
+impl<'a, T: Component> Iterator for SingleComponentIterator<'a, T> {
+  type Item = (&'a T, Entity);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if let Some(e) = self.entity.next() {
+      let x = self.data.next().unwrap();
+      return Some((x, *e));
+    }
+
+    return None;
+  }
+}
+
+impl<'a, A: Component, B: Component> Iterator for DoubleComponentIterator<'a, A, B> {
+  type Item = (&'a A, &'a B, Entity);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      if let Some(e) = self.entity.next() {
+        if self.a.has(*e) && self.b.has(*e) {
+          let a = self.a.get(*e).unwrap();
+          let b = self.b.get(*e).unwrap();
+          return Some((a, b, *e));
+        }
+      }
+      else {
+        break;
+      }
+    }
+
+    return None;
+  }
+}
+
+pub trait ComponentTuple<'a> {
+  type IterType;
+  fn begin(world: &'a World) -> Self::IterType;
+}
+
+impl<'a, T: 'static + Component> ComponentTuple<'a> for (T,) {
+  type IterType = SingleComponentIterator<'a, T>;
+
+  fn begin(world: &'a World) -> Self::IterType {
+    return SingleComponentIterator::<'a, T> {
+      entity: world.get_storage::<T>().entities.iter(),
+      data: world.get_storage::<T>().data.iter()
+    }
+  }
+}
+
+impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for (A, B) {
+  type IterType = DoubleComponentIterator<'a, A, B>;
+
+  fn begin(world: &'a World) -> Self::IterType {
+    let a = world.get_storage::<A>();
+    let b = world.get_storage::<B>();
+
+    let shorter = if a.num_entities() < b.num_entities() {
+      a.entities.iter()
+    }
+    else {
+      b.entities.iter()
+    };
+
+    return DoubleComponentIterator::<'a, A, B> {
+      entity: shorter,
+      a,
+      b
+    }
   }
 }
