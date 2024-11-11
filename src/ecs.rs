@@ -60,8 +60,7 @@ impl World {
     let gen = self.generation[idx as usize] as u64;
 
     return Entity {
-      word: (gen << 32) | idx
-    };
+      word: (gen << 32) | idx    };
   }
 
   fn check(&self, e: Entity) -> bool {
@@ -203,6 +202,10 @@ impl<T: 'static + Component> GenericComponentStorage for ComponentStorage<T> {
   }
 }
 
+pub struct With<T> {
+  phantom: std::marker::PhantomData<T>,
+}
+
 pub struct SingleComponentIterator<'a, T: Component> {
   entity: std::slice::Iter<'a, Entity>,
   data: std::slice::Iter<'a, T>
@@ -210,7 +213,7 @@ pub struct SingleComponentIterator<'a, T: Component> {
 
 pub struct DoubleComponentIterator<'a, A: Component, B: Component> {
   entity: std::slice::Iter<'a, Entity>,
-  a: &'a ComponentStorage<A>,
+  a: std::slice::Iter<'a, A>,
   b: &'a ComponentStorage<B>
 }
 
@@ -232,9 +235,12 @@ impl<'a, A: Component, B: Component> Iterator for DoubleComponentIterator<'a, A,
 
   fn next(&mut self) -> Option<Self::Item> {
     loop {
-      if let Some(e) = self.entity.next() {
-        if self.a.has(*e) && self.b.has(*e) {
-          let a = self.a.get(*e).unwrap();
+      let maybe_e = self.entity.next();
+      let maybe_a = self.a.next();
+
+      if let Some(e) = maybe_e {
+        if self.b.has(*e) {
+          let a = maybe_a.unwrap();
           let b = self.b.get(*e).unwrap();
           return Some((a, b, *e));
         }
@@ -253,7 +259,7 @@ pub trait ComponentTuple<'a> {
   fn begin(world: &'a World) -> Self::IterType;
 }
 
-impl<'a, T: 'static + Component> ComponentTuple<'a> for (T,) {
+impl<'a, T: 'static + Component> ComponentTuple<'a> for (&T,) {
   type IterType = SingleComponentIterator<'a, T>;
 
   fn begin(world: &'a World) -> Self::IterType {
@@ -264,7 +270,7 @@ impl<'a, T: 'static + Component> ComponentTuple<'a> for (T,) {
   }
 }
 
-impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for (A, B) {
+impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for (&A, With<B>) {
   type IterType = DoubleComponentIterator<'a, A, B>;
 
   fn begin(world: &'a World) -> Self::IterType {
@@ -280,7 +286,7 @@ impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for 
 
     return DoubleComponentIterator::<'a, A, B> {
       entity: shorter,
-      a,
+      a: a.data.iter(),
       b
     }
   }

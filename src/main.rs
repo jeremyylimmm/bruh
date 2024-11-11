@@ -95,7 +95,7 @@ fn main() -> std::result::Result<(), String> {
       
       render_queue.clear();
       
-      for (m, t, _) in world.view::<(StaticMeshComponent, TransformComponent)>() {
+      for (m, t, _) in world.view::<(&StaticMeshComponent, ecs::With<TransformComponent>)>() {
         render_queue.push((m.mesh, t.matrix));
       }
       
