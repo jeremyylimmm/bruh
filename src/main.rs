@@ -12,6 +12,10 @@ struct StaticMeshComponent {
     mesh: renderer::StaticMesh
 }
 
+struct TransformComponent {
+    matrix: matrix::Float4x4
+}
+
 fn main() -> std::result::Result<(), String> {
     let mut world = ecs::World::new();
 
@@ -56,6 +60,12 @@ fn main() -> std::result::Result<(), String> {
             world.add(e, StaticMeshComponent{
                 mesh: renderer.new_static_mesh(&cpu_mesh)
             });
+
+            let transform = matrix::translation(&[0.0, -1.0, 0.0]) * matrix::scaling(&[2.0, 2.0, 2.0]);
+
+            world.add(e, TransformComponent{
+                matrix: transform
+            });
         }
 
         let start = std::time::Instant::now();
@@ -76,7 +86,7 @@ fn main() -> std::result::Result<(), String> {
 
             render_queue.clear();
 
-            for (mesh_comp, _) in world.view::<StaticMeshComponent>() {
+            for (mesh_comp, _) in world.view::<(StaticMeshComponent,)>() {
                 let transform = matrix::translation(&[0.0, -1.0, 0.0]) * matrix::scaling(&[2.0, 2.0, 2.0]);
                 render_queue.push((mesh_comp.mesh, transform));
             }
