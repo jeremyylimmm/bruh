@@ -7,7 +7,7 @@ mod ecs;
 use nalgebra::*;
 
 use renderer::StaticMesh;
-use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*, Win32::UI::Input::KeyboardAndMouse::*};
+use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*, Win32::UI::Input::KeyboardAndMouse::*, Win32::UI::Input::*};
 
 struct StaticMeshComponent {
   mesh: renderer::StaticMesh
@@ -39,6 +39,15 @@ fn main() -> std::result::Result<(), String> {
   let mut world = ecs::World::new();
   
   unsafe {
+    let raw_input_device = RAWINPUTDEVICE {
+      usUsagePage: 0x01,
+      usUsage: 0x02,
+      dwFlags: RIDEV_NOLEGACY,
+      ..Default::default()
+    };
+
+    RegisterRawInputDevices(&[raw_input_device], std::mem::size_of_val(&raw_input_device) as u32).map_err(|_|"failed to register mouse")?;
+
     let wc = WNDCLASSA {
       hInstance: GetModuleHandleA(None).unwrap().into(),
       lpfnWndProc: Some(window_proc),
@@ -65,9 +74,7 @@ fn main() -> std::result::Result<(), String> {
     
     _ = ShowWindow(window, SW_MAXIMIZE);
     
-    let mut events = WindowEvents {
-      closed: false
-    };
+    let mut events = WindowEvents::default();
     
     SetWindowLongPtrA(window, GWLP_USERDATA, &mut events as *mut WindowEvents as isize);
     
@@ -176,11 +183,15 @@ fn main() -> std::result::Result<(), String> {
     // Prepare for rendering
     let mut render_queue = Vec::new();
 
-    let mut camera_transform = Matrix4::<f32>::new_translation(&Vector3::new(-5.0, 2.0, 0.0));
-
-    let camera_speed: f32 = 1.0;
-
     let mut last_time = std::time::Instant::now();
+
+    let camera_speed: f32 = 5.0;
+
+    let mut camera_pitch = 0.0;
+    let mut camera_yaw = 0.0;
+    let mut camera_pos = Vector3::new(-5.0, 2.0, 0.0);
+
+    let look_sensitivity = 0.001;
     
     // Main loop
     loop {
@@ -200,20 +211,29 @@ fn main() -> std::result::Result<(), String> {
         break;
       }
 
+      camera_pitch -= events.mouse_dy * look_sensitivity;
+      camera_yaw -= events.mouse_dx * look_sensitivity;
+
+      let camera_rotation = Matrix4::from_euler_angles(camera_pitch, camera_yaw, 0.0);
+
+      let forward = (camera_rotation * Vector4::new(0.0, 0.0, -1.0, 0.0)).xyz();
+      let right = forward.cross(&Vector3::new(0.0, 1.0, 0.0));
+
+
       if keydown(VK_W) {
-        camera_transform = Matrix4::new_translation(&Vector3::new(0.0, 0.0, -camera_speed * delta_time)) * camera_transform;
+        camera_pos += forward * camera_speed * delta_time;
       }
 
       if keydown(VK_S) {
-        camera_transform = Matrix4::new_translation(&Vector3::new(0.0, 0.0, camera_speed * delta_time)) * camera_transform;
+        camera_pos -= forward * camera_speed * delta_time;
       }
 
       if keydown(VK_A) {
-        camera_transform = Matrix4::new_translation(&Vector3::new(-camera_speed * delta_time, 0.0, 0.0)) * camera_transform;
+        camera_pos -= right * camera_speed * delta_time;
       }                                                                                     
                                                                                             
       if keydown(VK_D) {                                                                    
-        camera_transform = Matrix4::new_translation(&Vector3::new( camera_speed * delta_time, 0.0, 0.0)) * camera_transform;
+        camera_pos += right * camera_speed * delta_time;
       }
       
       render_queue.clear();
@@ -222,10 +242,12 @@ fn main() -> std::result::Result<(), String> {
       //  render_queue.push((m.mesh, t.matrix));
       //}
 
-      for (t, m) in &shit {
+      for (t, m) in shit.iter().rev() {
         render_queue.push((*m, *t));
       }
 
+
+      let camera_transform = Matrix4::new_translation(&camera_pos) * camera_rotation;
       let view_matrix = camera_transform.try_inverse().expect("Failed to inverse camera matrix");
       renderer.render(&render_queue, view_matrix);
     }
@@ -240,29 +262,54 @@ fn keydown(key: VIRTUAL_KEY) -> bool {
 
 struct WindowEvents {
   closed: bool,
+  mouse_dx: f32,
+  mouse_dy: f32
 }
 
 impl WindowEvents {
-  fn reset(&mut self) {
-    *self = WindowEvents {
+  fn default() -> Self {
+    return WindowEvents {
       closed: false,
+      mouse_dx: 0.0,
+      mouse_dy: 0.0
     };
+  }
+
+  fn reset(&mut self) {
+    *self = Self::default();
   }
 }
 
 extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-  let mut result = LRESULT::default();
-  
   let events: &mut WindowEvents = unsafe{&mut *(GetWindowLongPtrA(window, GWLP_USERDATA) as *mut WindowEvents)};
   
   match msg {
     WM_CLOSE => {
       events.closed = true;
     },
+
+    WM_INPUT => {
+      unsafe {
+        let mut data_size: u32 = 0;
+
+        let raw_input = HRAWINPUT(lparam.0 as *mut LPARAM as *mut std::ffi::c_void);
+        GetRawInputData(raw_input, RID_INPUT, None, &mut data_size, std::mem::size_of::<RAWINPUTHEADER>() as u32);
+
+        let data = vec![0 as u8;data_size as usize];
+        GetRawInputData(raw_input, RID_INPUT, Some(data.as_ptr() as _), &mut data_size, std::mem::size_of::<RAWINPUTHEADER>() as u32);
+
+        let input = &*(data.as_ptr() as *const RAWINPUT);
+
+        if input.header.dwType == RIM_TYPEMOUSE.0 {
+          events.mouse_dx += input.data.mouse.lLastX as f32;
+          events.mouse_dy += input.data.mouse.lLastY as f32;
+        }
+      }
+    }
+
     _ => {
-      result = unsafe{DefWindowProcA(window, msg, wparam, lparam)};
     }
   }
   
-  return result;
+  return unsafe{DefWindowProcA(window, msg, wparam, lparam)};
 }

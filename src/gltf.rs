@@ -486,37 +486,47 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
       None
     };
 
-    if node.contains_key("matrix") {
-      return Err("node contains matrix which is not handled");
-    }
+    let local_transform = if node.contains_key("matrix") {
+      let mut data = [0.0 as f32;16];
 
-    let scale = if node.contains_key("scale") {
-      as_vec::<3>(&node["scale"])?
-    }
-    else {
-      Vector3::new(1.0, 1.0, 1.0)
-    };
+      for (i , x) in node["matrix"].as_array().ok_or("matrix not array")?.iter().enumerate() {
+        let val = x.as_number().ok_or("matrix entry not number")? as f32;
+        data[i] = val;
+      }
 
-    let translation = if node.contains_key("translation") {
-      as_vec::<3>(&node["translation"])?
+      Matrix4::<f32>::from_row_slice(&data).transpose()
     }
     else {
-      Vector3::zeros()
+
+      let scale = if node.contains_key("scale") {
+        as_vec::<3>(&node["scale"])?
+      }
+      else {
+        Vector3::new(1.0, 1.0, 1.0)
+      };
+
+      let translation = if node.contains_key("translation") {
+        as_vec::<3>(&node["translation"])?
+      }
+      else {
+        Vector3::zeros()
+      };
+
+      let rotation = if node.contains_key("rotation") {
+        let vec = as_vec::<4>(&node["rotation"])?;
+        let quat = geometry::Quaternion::from_vector(vec);
+        geometry::UnitQuaternion::from_quaternion(-quat)
+      }
+      else {
+        geometry::UnitQuaternion::identity()
+      };
+
+      let scaling_m: Matrix4<f32> = Matrix4::new_nonuniform_scaling(&scale);
+      let rotation_m: Matrix4<f32> = rotation.to_rotation_matrix().to_homogeneous();
+      let translation_m: Matrix4<f32> = Matrix4::new_translation(&translation);
+
+      translation_m * rotation_m * scaling_m
     };
-
-    let rotation = if node.contains_key("rotation") {
-      let quat = geometry::Quaternion::from_vector(as_vec::<4>(&node["rotation"])?);
-      geometry::UnitQuaternion::from_quaternion(quat)
-    }
-    else {
-      geometry::UnitQuaternion::identity()
-    };
-
-    let scaling_m: Matrix4<f32> = Matrix4::new_nonuniform_scaling(&scale);
-    let rotation_m: Matrix4<f32> = rotation.to_rotation_matrix().to_homogeneous();
-    let translation_m: Matrix4<f32> = Matrix4::new_translation(&translation);
-
-    let local_transform = translation_m * rotation_m * scaling_m;
 
     nodes.push(SceneNode{
       local_transform,
@@ -524,6 +534,8 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
       mesh
     });
   }
+
+  std::assert!(nodes.len() == root.get("nodes").unwrap().as_array().unwrap().len());
 
   let mut scenes = Vec::new();
 
