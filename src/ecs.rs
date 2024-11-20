@@ -1,18 +1,13 @@
+use std::u64;
 use std::usize;
 use std::any::*;
 use std::collections::HashMap;
 
 pub trait Component {}
 
-#[derive(Copy, Clone)]
+#[derive(Eq, Hash, PartialEq, Copy, Clone)]
 pub struct Entity {
   word: u64
-}
-
-impl PartialEq<Entity> for Entity {
-  fn eq(&self, other: &Entity) -> bool {
-    return self.word == other.word;
-  }
 }
 
 impl Entity {
@@ -23,6 +18,16 @@ impl Entity {
   fn generation(&self) -> u32 {
     return (self.word >> 32) as u32;
   }
+
+  pub fn is_null(&self) -> bool {
+    return *self == null_entity();
+  }
+}
+
+pub fn null_entity() -> Entity {
+  return Entity {
+    word: u64::MAX
+  };
 }
 
 pub struct World {
@@ -40,7 +45,7 @@ impl World {
     }
   }
 
-  pub fn register<T: 'static + Component>(&mut self) {
+  fn register<T: 'static + Component>(&mut self) {
     let id = TypeId::of::<T>();
 
     if !self.storage.contains_key(&id) {
@@ -78,11 +83,13 @@ impl World {
     }
   }
 
-  fn get_storage<T: 'static + Component>(&self) -> &ComponentStorage<T> {
+  fn get_storage<T: 'static + Component>(&mut self) -> &ComponentStorage<T> {
+    self.register::<T>();
     return self.storage.get(&TypeId::of::<T>()).expect("component not registered").as_any().downcast_ref().unwrap();
   }
 
   fn get_storage_mut<T: 'static + Component>(&mut self) -> &mut ComponentStorage<T> {
+    self.register::<T>();
     return self.storage.get_mut(&TypeId::of::<T>()).expect("component not registered").as_any_mut().downcast_mut().unwrap();
   }
 
@@ -90,11 +97,15 @@ impl World {
     self.get_storage_mut().add(e, x);
   }
 
+  pub fn has<T: 'static + Component>(&mut self, e: Entity) -> bool {
+    return self.get_storage::<T>().has(e);
+  }
+
   pub fn remove<T: 'static + Component>(&mut self, e: Entity) {
     self.get_storage_mut::<T>().remove(e);
   }
 
-  pub fn get<T: 'static + Component>(&self, e: Entity) -> Option<&T> {
+  pub fn get<T: 'static + Component>(&mut self, e: Entity) -> Option<&T> {
     return self.get_storage().get(e);
   }
 
@@ -102,7 +113,7 @@ impl World {
     return self.get_storage_mut().get_mut(e);
   }
 
-  pub fn view<'a, T: 'static + ComponentTuple<'a>>(&'a self) -> T::IterType {
+  pub fn view<'a, T: 'static + ComponentTuple<'a>>(&'a mut self) -> T::IterType {
     return T::begin(self);
   }
 }
@@ -206,18 +217,41 @@ pub struct With<T> {
   phantom: std::marker::PhantomData<T>,
 }
 
-pub struct SingleComponentIterator<'a, T: Component> {
+pub struct Without<T> {
+  phantom: std::marker::PhantomData<T>
+}
+
+pub struct IterA<'a, T: Component> {
   entity: std::slice::Iter<'a, Entity>,
   data: std::slice::Iter<'a, T>
 }
 
-pub struct DoubleComponentIterator<'a, A: Component, B: Component> {
+pub struct IterAB<'a, A: Component, B: Component> {
   entity: std::slice::Iter<'a, Entity>,
   a: std::slice::Iter<'a, A>,
   b: &'a ComponentStorage<B>
 }
 
-impl<'a, T: Component> Iterator for SingleComponentIterator<'a, T> {
+pub struct IterMutAB<'a, A: Component, B: Component> {
+  entity: std::slice::Iter<'a, Entity>,
+  a: std::slice::IterMut<'a, A>,
+  b: &'a ComponentStorage<B>
+}
+
+pub struct IterAWithoutB<'a, A: Component, B: Component> {
+  entity: std::slice::Iter<'a, Entity>,
+  a: std::slice::Iter<'a, A>,
+  b: &'a ComponentStorage<B>
+}
+
+pub struct IterABWithoutC<'a, A: Component, B: Component, C: Component> {
+  entity: std::slice::Iter<'a, Entity>,
+  a: std::slice::Iter<'a, A>,
+  b: &'a ComponentStorage<B>,
+  c: &'a ComponentStorage<C>
+}
+
+impl<'a, T: Component> Iterator for IterA<'a, T> {
   type Item = (&'a T, Entity);
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -230,7 +264,7 @@ impl<'a, T: Component> Iterator for SingleComponentIterator<'a, T> {
   }
 }
 
-impl<'a, A: Component, B: Component> Iterator for DoubleComponentIterator<'a, A, B> {
+impl<'a, A: Component, B: Component> Iterator for IterAB<'a, A, B> {
   type Item = (&'a A, &'a B, Entity);
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -254,40 +288,163 @@ impl<'a, A: Component, B: Component> Iterator for DoubleComponentIterator<'a, A,
   }
 }
 
+impl<'a, A: Component, B: Component> Iterator for IterMutAB<'a, A, B> {
+  type Item = (&'a mut A, &'a B, Entity);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      let maybe_e = self.entity.next();
+      let maybe_a = self.a.next();
+
+      if let Some(e) = maybe_e {
+        if self.b.has(*e) {
+          let a = maybe_a.unwrap();
+          let b = self.b.get(*e).unwrap();
+          return Some((a, b, *e));
+        }
+      }
+      else {
+        break;
+      }
+    }
+
+    return None;
+  }
+}
+
+impl<'a, A: Component, B: Component> Iterator for IterAWithoutB<'a, A, B> {
+  type Item = (&'a A, Entity);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      let maybe_e = self.entity.next();
+      let maybe_a = self.a.next();
+
+      if let Some(e) = maybe_e {
+        if !self.b.has(*e) {
+          let a = maybe_a.unwrap();
+          return Some((a, *e));
+        }
+      }
+      else {
+        break;
+      }
+    }
+
+    return None;
+  }
+}
+
+impl<'a, A: Component, B: Component, C: Component> Iterator for IterABWithoutC<'a, A, B, C> {
+  type Item = (&'a A, &'a B, Entity);
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      let maybe_e = self.entity.next();
+      let maybe_a = self.a.next();
+
+      if let Some(e) = maybe_e {
+        if self.b.has(*e) && !self.c.has(*e) {
+          let a = maybe_a.unwrap();
+          let b = self.b.get(*e).unwrap();
+          return Some((a, b, *e));
+        }
+      }
+      else {
+        break;
+      }
+    }
+
+    return None;
+  }
+}
+
 pub trait ComponentTuple<'a> {
   type IterType;
-  fn begin(world: &'a World) -> Self::IterType;
+  fn begin(world: &'a mut World) -> Self::IterType;
 }
 
 impl<'a, T: 'static + Component> ComponentTuple<'a> for (&T,) {
-  type IterType = SingleComponentIterator<'a, T>;
+  type IterType = IterA<'a, T>;
 
-  fn begin(world: &'a World) -> Self::IterType {
-    return SingleComponentIterator::<'a, T> {
-      entity: world.get_storage::<T>().entities.iter(),
-      data: world.get_storage::<T>().data.iter()
+  fn begin(world: &'a mut World) -> Self::IterType {
+    let comp = world.get_storage::<T>();
+
+    let entity = comp.entities.iter();
+    let data = comp.data.iter();
+
+    return IterA::<'a, T> {
+      entity,
+      data
     }
   }
 }
 
 impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for (&A, With<B>) {
-  type IterType = DoubleComponentIterator<'a, A, B>;
+  type IterType = IterAB<'a, A, B>;
 
-  fn begin(world: &'a World) -> Self::IterType {
-    let a = world.get_storage::<A>();
+  fn begin(world: &'a mut World) -> Self::IterType {
+    let ap = world.get_storage::<A>() as *const ComponentStorage<A>;
+    let a = unsafe{&*ap};
     let b = world.get_storage::<B>();
 
-    let shorter = if a.num_entities() < b.num_entities() {
-      a.entities.iter()
-    }
-    else {
-      b.entities.iter()
-    };
-
-    return DoubleComponentIterator::<'a, A, B> {
-      entity: shorter,
+    return IterAB::<'a, A, B> {
+      entity: a.entities.iter(),
       a: a.data.iter(),
-      b
+      b: b
+    }
+  }
+}
+
+impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for (&mut A, With<B>) {
+  type IterType = IterMutAB<'a, A, B>;
+
+  fn begin(world: &'a mut World) -> Self::IterType {
+    assert!(TypeId::of::<A>() != TypeId::of::<B>());
+
+    let ap = world.get_storage_mut::<A>() as *mut ComponentStorage<A>;
+    let a = unsafe{&mut *ap};
+    let b = world.get_storage::<B>();
+
+    return IterMutAB::<'a, A, B> {
+      entity: a.entities.iter(),
+      a: a.data.iter_mut(),
+      b: b
+    }
+  }
+}
+
+impl<'a, A: 'static + Component, B: 'static + Component> ComponentTuple<'a> for (&A, Without<B>) {
+  type IterType = IterAWithoutB<'a, A, B>;
+
+  fn begin(world: &'a mut World) -> Self::IterType {
+    let ap = world.get_storage::<A>() as *const ComponentStorage<A>;
+    let a = unsafe{&*ap};
+    let b = world.get_storage::<B>();
+
+    return IterAWithoutB::<'a, A, B> {
+      entity: a.entities.iter(),
+      a: a.data.iter(),
+      b: b
+    }
+  }
+}
+
+impl<'a, A: 'static + Component, B: 'static + Component, C: 'static + Component> ComponentTuple<'a> for (&A, With<B>, Without<C>) {
+  type IterType = IterABWithoutC<'a, A, B, C>;
+
+  fn begin(world: &'a mut World) -> Self::IterType {
+    let ap = world.get_storage::<A>() as *const ComponentStorage<A>;
+    let bp = world.get_storage::<B>() as *const ComponentStorage<B>;
+    let a = unsafe{&*ap};
+    let b = unsafe{&*bp};
+    let c = world.get_storage::<C>();
+
+    return IterABWithoutC::<'a, A, B, C> {
+      entity: a.entities.iter(),
+      a: a.data.iter(),
+      b,
+      c
     }
   }
 }

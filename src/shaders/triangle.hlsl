@@ -34,8 +34,8 @@ VSOut vs_main(uint vid : SV_VertexID) {
   float4x4 transform = transforms[transform_index].m;
 
   VSOut vso;
-  vso.sv_pos = mul(mul(float4(vertex.pos, 1.0f), transform), view_proj);
-  vso.norm = normalize(mul(float4(vertex.norm, 0.0f), transform));
+  vso.sv_pos = mul(view_proj, mul(transform, float4(vertex.pos, 1.0f) ));
+  vso.norm = normalize(mul(transform, float4(vertex.norm, 0.0f)));
 
   return vso;
 }

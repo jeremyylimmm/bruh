@@ -91,7 +91,13 @@ struct ChunkHeader {
   ty: u32
 }
 
-pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
+pub struct SceneNode {
+  pub local_transform: Matrix4<f32>,
+  pub children: Vec<usize>,
+  pub mesh: Option<usize>
+}
+
+pub fn load(path_str: &str) -> Result<Contents, &'static str> {
   let path = std::path::Path::new(path_str);
 
   let dir= match path.parent() {
@@ -180,7 +186,15 @@ pub fn load(path_str: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str
   );
 }
 
-pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Option<Vec<Vec<u8>>>, dir: &str) -> Result<Vec<renderer::CPUStaticMesh>, &'static str> {
+pub
+struct Contents {
+  pub meshes: Vec<renderer::CPUStaticMesh>,
+  pub nodes: Vec<SceneNode>,
+  pub scenes: Vec<Vec<usize>>,
+  pub root_scene: usize
+}
+
+pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Option<Vec<Vec<u8>>>, dir: &str) -> Result<Contents, &'static str> {
   // Verify the version
 
   let asset = root.get("asset").ok_or("no asset")?.as_obj().ok_or("asset not object")?;
@@ -311,26 +325,6 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
     });
   }
 
-  // Gather nodes
-
-  let mut nodes = Vec::<Node>::new();
-
-  for n in root.get("nodes").ok_or("no nodes")?.as_array().ok_or("nodes not array")? {
-    let node = n.as_obj().ok_or("node not object")?;
-
-    let mesh = match node.get("mesh") {
-      Some(m) => Some(m.as_integer().ok_or("node mesh not integer")? as usize),
-      None => None
-    };
-
-    let name = node.get("name").ok_or("no node name")?.as_string().ok_or("node name node string")?;
-
-    nodes.push(Node{
-      mesh,
-      name
-    });
-  }
-
   // Gather scenes
 
   let mut scenes = Vec::<Scene>::new();
@@ -356,9 +350,6 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
       nodes: nds
     });
   }
-
-  // Root scene
-  let _scene = root.get("scene").ok_or("no root scene")?.as_integer().ok_or("root scene not integer")? as usize;
 
   let mut static_meshes = Vec::<renderer::CPUStaticMesh>::new();
 
@@ -470,5 +461,102 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
     }
   }
 
-  return Ok(static_meshes);
+  let mut nodes = Vec::<SceneNode>::new();
+
+  for n in root.get("nodes").ok_or("no nodes")?.as_array().ok_or("nodes not array")? {
+    let node = n.as_obj().ok_or("node not object")?;
+
+    let children: Vec<usize> = if node.contains_key("children") {
+      let mut list = Vec::new();
+
+      for c in node["children"].as_array().ok_or("node children not array")? {
+        list.push(c.as_integer().ok_or("node child not integer")? as usize);
+      }
+
+      list
+    }
+    else {
+      Vec::new()
+    };
+
+    let mesh = if node.contains_key("mesh") {
+      Some(node["mesh"].as_integer().ok_or("node mesh not integer")? as usize)
+    }
+    else {
+      None
+    };
+
+    if node.contains_key("matrix") {
+      return Err("node contains matrix which is not handled");
+    }
+
+    let scale = if node.contains_key("scale") {
+      as_vec::<3>(&node["scale"])?
+    }
+    else {
+      Vector3::new(1.0, 1.0, 1.0)
+    };
+
+    let translation = if node.contains_key("translation") {
+      as_vec::<3>(&node["translation"])?
+    }
+    else {
+      Vector3::zeros()
+    };
+
+    let rotation = if node.contains_key("rotation") {
+      let quat = geometry::Quaternion::from_vector(as_vec::<4>(&node["rotation"])?);
+      geometry::UnitQuaternion::from_quaternion(quat)
+    }
+    else {
+      geometry::UnitQuaternion::identity()
+    };
+
+    let scaling_m: Matrix4<f32> = Matrix4::new_nonuniform_scaling(&scale);
+    let rotation_m: Matrix4<f32> = rotation.to_rotation_matrix().to_homogeneous();
+    let translation_m: Matrix4<f32> = Matrix4::new_translation(&translation);
+
+    let local_transform = translation_m * rotation_m * scaling_m;
+
+    nodes.push(SceneNode{
+      local_transform,
+      children,
+      mesh
+    });
+  }
+
+  let mut scenes = Vec::new();
+
+  for s in root.get("scenes").ok_or("no scenes")?.as_array().ok_or("scenes not array")? {
+    let scn = s.as_obj().ok_or("scene not object")?;
+
+    let mut scene = Vec::<usize>::new();
+
+    for n in scn.get("nodes").ok_or("no scene nodes")?.as_array().ok_or("scene nodes not array")? {
+      scene.push(n.as_integer().ok_or("scene node not integer")? as usize);
+    }
+
+    scenes.push(scene);
+  }
+
+  let root_scene = root.get("scene").ok_or("no root scene")?.as_integer().ok_or("root scene not integer")? as usize;
+
+  return Ok(Contents{
+    meshes: static_meshes,
+    nodes,
+    scenes,
+    root_scene
+  });
+}
+
+fn as_vec<const N: usize>(node: &json::Node) -> Result<Vector<f32, Const<N>, ArrayStorage<f32, N, 1>>, &'static str> {
+  let s = node.as_array().ok_or("supposed vector not array")?;
+
+  let mut vals = Vector::<f32, Const<N>, ArrayStorage<f32, N, 1>>::zeros(); 
+
+  for (i, x) in s.iter().enumerate() {
+    vals[i] = x.as_number().ok_or("supposed vector contains non-number")? as _;
+  }
+
+  return Ok(vals);
 }

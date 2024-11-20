@@ -70,6 +70,14 @@ impl Node {
     };
   }
 
+  pub fn as_number(&self) -> Option<f64> {
+    return match self {
+      Node::Real(f) => Some(*f),
+      Node::Integer(i) => Some(*i as f64),
+      _ => None
+    };
+  }
+
   pub fn as_bool(&self) -> Option<bool> {
     return match self {
       Node::Boolean(b) => Some(*b),
