@@ -1,3 +1,4 @@
+use renderer_pool_handle_derive::HandledPoolHandle;
 use windows::Win32::{Graphics::Direct3D12::*, Graphics::Direct3D::*, Graphics::Dxgi::Common::*, Graphics::Dxgi::*, Foundation::*, UI::WindowsAndMessaging::*};
 use windows::core::*;
 
@@ -30,31 +31,25 @@ pub struct Renderer {
   camera_cbuffer: BufferedBuffer<Matrix4<f32>>,
   depth_buffer: Option<ID3D12Resource>,
   dsv: DescriptorHandle,
-  transform_pool: TransformPool,
-  static_mesh_pool: HandledPool<StaticMeshData, StaticMesh>
+
+  static_mesh_pool: HandledPool<StaticMeshData, StaticMesh>,
+  transform_pool: HandledPool<TransformData, Transform>,
+
+  free_transforms: Vec<Transform>,
+
+  resident_resources: Vec<ID3D12Resource>
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, HandledPoolHandle)]
 pub struct StaticMesh {
   index: u32,
   generation: u32
 }
 
-impl HandledPoolHandle for StaticMesh {
-  fn generation(&self) -> u32 {
-    return self.generation;
-  }
-
-  fn index(&self) -> usize {
-    return self.index as _;
-  }
-
-  fn make(index: u32, generation: u32) -> Self {
-    return Self {
-      index,
-      generation
-    };
-  }
+#[derive(Copy, Clone, HandledPoolHandle)]
+pub struct Transform {
+  index: u32,
+  generation: u32
 }
 
 #[repr(C)]
@@ -62,6 +57,10 @@ pub struct Vertex {
   pub pos: [f32;3],
   pub norm: [f32;3],
   pub tex_coord: [f32;2],
+}
+
+pub fn pad_256(x: usize) -> usize {
+  return (x + 255) & (!(255 as usize));
 }
 
 impl Renderer {
@@ -320,7 +319,6 @@ impl Renderer {
 
       let mut renderer = Renderer {
         dsv: dsv_heap.alloc(),
-        transform_pool: TransformPool::new(&device, &mut cbv_srv_uav_heap, 256 * 1024),
         camera_cbuffer: BufferedBuffer::new(&device, 1),
         frame: 0,
         device,
@@ -343,7 +341,10 @@ impl Renderer {
         root_signature,
         pipeline,
         depth_buffer: None,
-        static_mesh_pool: HandledPool::<StaticMeshData, StaticMesh>::new()
+        static_mesh_pool: HandledPool::new(),
+        transform_pool: HandledPool::new(),
+        free_transforms: Vec::new(),
+        resident_resources: Vec::new()
       };
 
       renderer.init_swapchain_resources();
@@ -352,7 +353,7 @@ impl Renderer {
     }
   }
 
-  pub fn render(&mut self, meshes: &Vec<(StaticMesh, Matrix4<f32>)>, view_matrix: Matrix4<f32>) {
+  pub fn render(&mut self, meshes: &Vec<(StaticMesh, Transform)>, view_matrix: Matrix4<f32>) {
     unsafe{
       self.match_window_size();
 
@@ -413,16 +414,14 @@ impl Renderer {
 
       cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame, 0));
 
-      self.transform_pool.reset();
-
       for (mesh_handle, transform) in meshes {
         let m = self.static_mesh_pool.get(*mesh_handle);
+        let t = self.transform_pool.get(*transform);
 
         cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.vbuffer_srv) as u32, 0); // Set vbuffer index
         cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.ibuffer_srv) as u32, 1); // Set ibuffer index
 
-        let transform_cbv = self.transform_pool.alloc(self.frame, transform);
-        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(transform_cbv) as u32, 2);
+        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(t.cbvs[self.frame]) as u32, 2);
 
         cmd_list.DrawInstanced(m.index_count as u32, 1, 0, 0);
       }
@@ -499,6 +498,56 @@ impl Renderer {
       };
 
       return self.static_mesh_pool.alloc(data);
+  }
+
+  pub fn new_transform(&mut self) -> Transform {
+    if self.free_transforms.is_empty() {
+      const POOL_COUNT: usize = 16;
+
+      let padded_size = pad_256(std::mem::size_of::<Matrix4<f32>>());
+
+      let buffer = make_buffer(&self.device, POOL_COUNT * padded_size * FRAMES_IN_FLIGHT, D3D12_HEAP_TYPE_UPLOAD);
+
+      let mut ptr = std::ptr::null_mut();
+      unsafe{buffer.Map(0, None, Some(&mut ptr))};
+
+      let base_virtual = unsafe{buffer.GetGPUVirtualAddress()};
+
+      for i in 0..POOL_COUNT {
+        let offset = |f: usize| -> usize {
+          (i * FRAMES_IN_FLIGHT + f) * padded_size
+        };
+
+        let data = TransformData  {
+          ptrs: std::array::from_fn(|f|unsafe{ptr.byte_add(offset(f))} as *mut Matrix4<f32>),
+          cbvs: std::array::from_fn(|_|self.cbv_srv_uav_heap.alloc())
+        };
+
+        for (f, cbv) in data.cbvs.iter().enumerate() {
+          unsafe {
+            self.device.CreateConstantBufferView(
+              Some(&cbv_desc(base_virtual + offset(f) as u64, padded_size)),
+              self.cbv_srv_uav_heap.cpu_handle(*cbv)
+            );
+          }
+        }
+
+        for p in data.ptrs {
+          unsafe{std::ptr::copy_nonoverlapping(&Matrix4::<f32>::identity(), p, 1)};
+        }
+
+        self.free_transforms.push(self.transform_pool.alloc(data));
+      }
+
+      self.resident_resources.push(buffer);
+    }
+
+    return self.free_transforms.pop().unwrap();
+  }
+
+  pub fn write_transform(&mut self, transform: Transform, matrix: &Matrix4::<f32>) {
+    let data = self.transform_pool.get(transform);
+    unsafe{std::ptr::copy_nonoverlapping(matrix, data.ptrs[self.frame], 1)};
   }
 
   fn init_swapchain_resources(&mut self) {
@@ -586,6 +635,8 @@ impl Renderer {
     let val = self.signal();
     self.wait(val);
   }
+
+  
 }
 
 fn transition_barrier(resource: &ID3D12Resource, state_before: D3D12_RESOURCE_STATES, state_after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
@@ -667,7 +718,7 @@ impl DescriptorHeap {
         },
 
         heap,
-        free_list: (0..capacity).collect(),
+        free_list: (0..capacity).rev().collect(),
         generation: vec![1;capacity as usize],
         stride: device.GetDescriptorHandleIncrementSize(desc_type) as usize,
       });
@@ -809,6 +860,13 @@ fn structured_buffer_srv_desc<T>(num_elements: usize) -> D3D12_SHADER_RESOURCE_V
   };
 }
 
+fn cbv_desc(location: u64, padded_size: usize) -> D3D12_CONSTANT_BUFFER_VIEW_DESC {
+  return D3D12_CONSTANT_BUFFER_VIEW_DESC {
+    BufferLocation: location,
+    SizeInBytes: padded_size as u32
+  };
+}
+
 #[allow(unused)]
 struct StaticMeshData {
   vbuffer: ID3D12Resource,
@@ -851,12 +909,13 @@ impl<T, H: HandledPoolHandle> HandledPool<T, H> {
   fn alloc(&mut self, data: T) -> H {
     if self.free_list.is_empty() {
       self.free_list.push(self.data.len());
-      self.data.push(Some(data));
+      self.data.push(None);
       self.generation.push(1);
     }
 
     let index = self.free_list.pop().unwrap();
     let generation = self.generation[index];
+    self.data[index] = Some(data);
 
     return H::make(index as u32, generation);
   }
@@ -880,55 +939,9 @@ impl<T, H: HandledPoolHandle> HandledPool<T, H> {
   }
 }
 
-struct TransformPool {
-  buffer: BufferedBuffer<Matrix4<f32>>,
-  cbvs: [Vec<DescriptorHandle>;FRAMES_IN_FLIGHT],
-  next: usize,
-  count: usize
+struct TransformData {
+  cbvs: [DescriptorHandle; FRAMES_IN_FLIGHT],
+  ptrs: [*mut Matrix4<f32>; FRAMES_IN_FLIGHT]
 }
 
-impl TransformPool {
-  fn new(device: &ID3D12Device, cbv_srv_uav_heap: &mut DescriptorHeap, count: usize) -> Self {
-    let buffer = BufferedBuffer::new(&device, count);
-
-    let cbvs: [Vec<DescriptorHandle>;FRAMES_IN_FLIGHT] = std::array::from_fn(|_| {
-      (0..count).map(|_|cbv_srv_uav_heap.alloc()).collect()
-    });
-
-    for frame in 0..FRAMES_IN_FLIGHT {
-      for index in 0..count {
-        let cbv_desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-          BufferLocation: buffer.gpu_virtual_address(frame, index),
-          SizeInBytes: BufferedBuffer::<Matrix4<f32>>::padded_size() as u32,
-        };
-
-        unsafe{device.CreateConstantBufferView(Some(&cbv_desc), cbv_srv_uav_heap.cpu_handle(cbvs[frame][index]))};
-      }
-    }
-
-    return TransformPool {
-      buffer,
-      cbvs,
-      count,
-      next: 0
-    };
-  }
-
-  fn alloc(&mut self, frame: usize, transform: &Matrix4<f32>) -> DescriptorHandle {
-    if self.next == self.count {
-      panic!("out of transforms");
-    }
-
-    let idx = self.next;
-    self.next += 1;
-
-    self.buffer.write(frame, idx, transform);
-
-    return self.cbvs[frame][idx];
-  }
-
-  fn reset(&mut self) {
-    self.next = 0;
-  }
-}
 

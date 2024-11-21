@@ -85,11 +85,13 @@ fn main() -> std::result::Result<(), String> {
 
     // Load all meshes onto device
     let mut meshes = Vec::<renderer::StaticMesh>::new();
-    for cpu_mesh in gltf_contents.meshes {
-      meshes.push(renderer.new_static_mesh(&cpu_mesh));
+    for cpu_mesh in &gltf_contents.meshes {
+      meshes.push(renderer.new_static_mesh(cpu_mesh));
     }
 
-    let mut shit = Vec::<(Matrix4<f32>, StaticMesh)>::new();
+    std::assert!(meshes.len() == gltf_contents.meshes.len());
+
+    let mut shit = Vec::<(renderer::Transform, Matrix4<f32>, StaticMesh)>::new();
 
     {
       let mut stack = Vec::<(Matrix4<f32>, usize)>::new();
@@ -104,7 +106,7 @@ fn main() -> std::result::Result<(), String> {
         let transform = parent_transform * node.local_transform;
 
         if let Some(m) = node.mesh {
-          shit.push((transform, meshes[m]));
+          shit.push((renderer.new_transform(), transform, meshes[m]));
         }
 
         for c in &node.children {
@@ -242,8 +244,9 @@ fn main() -> std::result::Result<(), String> {
       //  render_queue.push((m.mesh, t.matrix));
       //}
 
-      for (t, m) in shit.iter().rev() {
-        render_queue.push((*m, *t));
+      for (t, matrix, mesh) in shit.iter().rev() {
+        renderer.write_transform(*t, matrix);
+        render_queue.push((*mesh, *t));
       }
 
 
