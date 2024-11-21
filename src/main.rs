@@ -2,42 +2,13 @@ mod renderer;
 mod json;
 mod gltf;
 mod base64;
-mod ecs;
 
 use nalgebra::*;
 
 use renderer::StaticMesh;
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*, Win32::UI::Input::KeyboardAndMouse::*, Win32::UI::Input::*};
 
-struct StaticMeshComponent {
-  mesh: renderer::StaticMesh
-}
-
-struct LocalTransformComponent {
-  matrix: Matrix4<f32>,
-}
-
-struct TransformComponent {
-  matrix: Matrix4<f32>
-}
-
-struct ChildrenComponent {
-  children: Vec<ecs::Entity>,
-}
-
-struct ParentComponent {
-  parent: ecs::Entity
-}
-
-impl ecs::Component for StaticMeshComponent {}
-impl ecs::Component for LocalTransformComponent {}
-impl ecs::Component for TransformComponent {}
-impl ecs::Component for ChildrenComponent {}
-impl ecs::Component for ParentComponent {}
-
 fn main() -> std::result::Result<(), String> {
-  let mut world = ecs::World::new();
-  
   unsafe {
     let raw_input_device = RAWINPUTDEVICE {
       usUsagePage: 0x01,
@@ -115,73 +86,6 @@ fn main() -> std::result::Result<(), String> {
       }
     }
 
-    //{ // Construct the scene hierarchy
-    //  let mut stack = Vec::<(ecs::Entity, usize)>::new();
-
-    //  for n in &gltf_contents.scenes[gltf_contents.root_scene] {
-    //    stack.push((ecs::null_entity(), *n));
-    //  }
-
-    //  while !stack.is_empty() {
-    //    let (parent, n) = stack.pop().unwrap();
-    //    let node = &gltf_contents.nodes[n];
-
-    //    let e = world.create();
-    //    world.add::<TransformComponent>(e, TransformComponent{matrix:matrix::Float4x4::identity()});
-    //    world.add::<LocalTransformComponent>(e, LocalTransformComponent{matrix:node.local_transform});
-
-    //    if !parent.is_null() {
-    //      if !world.has::<ChildrenComponent>(parent) {
-    //        world.add::<ChildrenComponent>(parent, ChildrenComponent{children: Vec::new()});
-    //      }
-
-    //      world.get_mut::<ChildrenComponent>(parent).unwrap().children.push(e);
-    //      world.add::<ParentComponent>(e, ParentComponent{parent});
-    //    }
-
-    //    if let Some(m) = node.mesh {
-    //      world.add::<StaticMeshComponent>(e, StaticMeshComponent{mesh:meshes[m]});
-    //    }
-
-    //    for c in &node.children {
-    //      stack.push((
-    //        e, *c
-    //      ));
-    //    }
-    //  }
-    //}
-
-    //// Bake all transforms
-
-    //{
-    //  for (global, local, _) in world.view::<(&mut TransformComponent, ecs::With<LocalTransformComponent>)>() {
-    //    global.matrix = local.matrix;
-    //  }
-
-    //  let mut stack = Vec::<(matrix::Float4x4, ecs::Entity)>::new();
-
-    //  for (t, children, _) in world.view::<(&TransformComponent, ecs::With<ChildrenComponent>, ecs::Without<ParentComponent>)>() {
-    //    for c in &children.children {
-    //      stack.push((t.matrix, *c));
-    //    }
-    //  }
-
-    //  while !stack.is_empty() {
-    //    let (parent_transform, e) = stack.pop().unwrap();
-
-    //    let local = world.get::<LocalTransformComponent>(e).unwrap().matrix;
-    //    let transform = parent_transform * local;
-
-    //    world.get_mut::<TransformComponent>(e).unwrap().matrix = transform;
-
-    //    if let Some(children) = world.get::<ChildrenComponent>(e) {
-    //      for c in &children.children {
-    //        stack.push((transform, *c));
-    //      }
-    //    }
-    //  }
-    //}
-
     // Prepare for rendering
     let mut render_queue = Vec::new();
 
@@ -240,10 +144,6 @@ fn main() -> std::result::Result<(), String> {
       
       render_queue.clear();
       
-      //for (m, t, _) in world.view::<(&StaticMeshComponent, ecs::With<TransformComponent>)>() {
-      //  render_queue.push((m.mesh, t.matrix));
-      //}
-
       for (t, matrix, mesh) in shit.iter().rev() {
         renderer.write_transform(*t, matrix);
         render_queue.push((*mesh, *t));
