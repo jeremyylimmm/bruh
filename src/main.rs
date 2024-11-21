@@ -6,9 +6,49 @@ mod gltf;
 mod base64;
 
 use nalgebra::*;
-
-use renderer::StaticMesh;
 use windows::{core::*, Win32::System::LibraryLoader::*, Win32::Foundation::*, Win32::UI::WindowsAndMessaging::*, Win32::UI::Input::KeyboardAndMouse::*, Win32::UI::Input::*};
+
+use bevy_ecs::prelude::*;
+
+#[derive(Component)]
+struct StaticMeshComponent {
+  mesh: renderer::StaticMesh,
+}
+
+#[derive(Component)]
+struct TransformComponent {
+  transform: renderer::Transform,
+  matrix: Matrix4<f32>
+}
+
+#[derive(Component)]
+struct ChildrenComponent {
+  children: Vec<Entity>,
+}
+
+#[derive(Component)]
+struct ParentComponent {
+  parent: Entity
+}
+
+#[derive(Component)]
+struct LocalTransformComponent {
+  matrix: Matrix4<f32>
+}
+
+fn parent_entity(world: &mut World, child: Entity, parent: Entity) {
+  if let Some(old_parent_comp) = world.get::<ParentComponent>(child) {
+    world.get_entity_mut(old_parent_comp.parent).unwrap().get_mut::<ChildrenComponent>().unwrap().children.retain(|x|*x != child);
+  }
+
+  world.entity_mut(child).insert(ParentComponent{parent});
+
+  if !world.entity(parent).contains::<ChildrenComponent>() {
+    world.entity_mut(parent).insert(ChildrenComponent{children:Vec::new()});
+  }
+
+  world.get_mut::<ChildrenComponent>(parent).unwrap().children.push(child);
+}
 
 fn main() -> std::result::Result<(), String> {
   unsafe {
@@ -63,31 +103,71 @@ fn main() -> std::result::Result<(), String> {
       meshes.push(v);
     }
 
-    std::assert!(meshes.len() == gltf_contents.meshes.len());
-
-    let mut shit = Vec::<(renderer::Transform, Matrix4<f32>, StaticMesh)>::new();
+    let mut world = World::new();
 
     {
-      let mut stack = Vec::<(Matrix4<f32>, usize)>::new();
+      let mut stack = Vec::<(Option<Entity>, usize)>::new();
 
       for n in &gltf_contents.scenes[gltf_contents.root_scene] {
-        stack.push((Matrix4::<f32>::identity(), *n));
+        stack.push((None, *n));
       }
 
-      while let Some((parent_transform, node_idx)) = stack.pop() {
+      while let Some((parent, node_idx)) = stack.pop() {
         let node = &gltf_contents.nodes[node_idx];
 
-        let transform = parent_transform * node.local_transform;
+        let e = world.spawn((
+          TransformComponent{transform:renderer.new_transform(), matrix:Matrix4::identity()},
+          LocalTransformComponent{matrix:node.local_transform}
+        )).id();
+
+        if let Some(p) = parent {
+          parent_entity(&mut world, e, p);
+        }
 
         if let Some(mesh_idx) = node.mesh {
-          let meshes = &meshes[mesh_idx];
-          for m in meshes {
-            shit.push((renderer.new_transform(), transform, *m));
+          for m in &meshes[mesh_idx] {
+            let me = world.spawn((
+              TransformComponent{transform:renderer.new_transform(), matrix:Matrix4::identity()},
+              LocalTransformComponent{matrix:Matrix4::identity()},
+              StaticMeshComponent{mesh: *m}
+            )).id();
+
+            parent_entity(&mut world, me, e);
           }
         }
 
         for c in &node.children {
-          stack.push((transform, *c));
+          stack.push((Some(e), *c));
+        }
+      }
+    }
+
+    // Resolve transforms
+
+    {
+      let mut stack = Vec::<(Matrix4::<f32>, Entity)>::new();
+
+      for (mut global, local, children) in world.query_filtered::<(&mut TransformComponent, &mut LocalTransformComponent, Option<&ChildrenComponent>), Without<ParentComponent>>().iter_mut(&mut world) {
+        global.matrix = local.matrix;
+
+        if let Some(children_comp) = children {
+          for c in &children_comp.children {
+            stack.push((global.matrix, *c));
+          }
+        }
+      }
+
+      while let Some((parent_transform, e)) = stack.pop() {
+        let local = world.get::<LocalTransformComponent>(e).unwrap().matrix;
+        let mut global = world.get_mut::<TransformComponent>(e).unwrap();
+
+        let transform = parent_transform * local;
+        global.matrix = transform;
+
+        if let Some(children) = world.get::<ChildrenComponent>(e) {
+          for c in &children.children {
+            stack.push((transform, *c));
+          }
         }
       }
     }
@@ -151,9 +231,9 @@ fn main() -> std::result::Result<(), String> {
       
       render_queue.clear();
       
-      for (t, matrix, mesh) in &shit {
-        renderer.write_transform(*t, matrix);
-        render_queue.push((*mesh, *t));
+      for (mesh, transform) in world.query::<(&StaticMeshComponent, &TransformComponent)>().iter(&world) {
+        renderer.write_transform(transform.transform, &transform.matrix);
+        render_queue.push((mesh.mesh, transform.transform));
       }
 
 

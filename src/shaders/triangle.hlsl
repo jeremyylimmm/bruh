@@ -42,5 +42,9 @@ VSOut vs_main(uint vid : SV_VertexID) {
 
 float4 ps_main(VSOut vso) : SV_Target {
   float3 norm = normalize(vso.norm);
-  return float4(sqrt(norm * 0.5f + 0.5f), 1.0f);
+
+  float3 light_dir = normalize(float3(-1.0, 1.0, 1.0));
+  float3 diffuse = max(dot(norm, light_dir), 0.0).xxx;
+
+  return float4(sqrt(diffuse), 1.0f);
 }
