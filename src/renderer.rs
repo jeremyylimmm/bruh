@@ -353,6 +353,10 @@ impl Renderer {
     }
   }
 
+  pub fn acquire_frame(&self) {
+    self.wait(self.frame_fences[self.frame]);
+  }
+
   pub fn render(&mut self, meshes: &Vec<(StaticMesh, Transform)>, view_matrix: Matrix4<f32>) {
     unsafe{
       self.match_window_size();
@@ -361,8 +365,6 @@ impl Renderer {
 
       let cmd_list = &self.cmd_lists[self.frame];
       let cmd_allocator = &self.cmd_allocators[self.frame];
-
-      self.wait(self.frame_fences[self.frame]);
 
       cmd_allocator.Reset().unwrap();
       cmd_list.Reset(cmd_allocator, None).unwrap();
@@ -509,7 +511,7 @@ impl Renderer {
       let buffer = make_buffer(&self.device, POOL_COUNT * padded_size * FRAMES_IN_FLIGHT, D3D12_HEAP_TYPE_UPLOAD);
 
       let mut ptr = std::ptr::null_mut();
-      unsafe{buffer.Map(0, None, Some(&mut ptr))};
+      unsafe{buffer.Map(0, None, Some(&mut ptr)).unwrap()};
 
       let base_virtual = unsafe{buffer.GetGPUVirtualAddress()};
 

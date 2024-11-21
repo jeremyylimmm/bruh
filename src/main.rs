@@ -1,5 +1,7 @@
+#[allow(unused)]
 mod renderer;
 mod json;
+#[allow(unused)]
 mod gltf;
 mod base64;
 
@@ -55,9 +57,10 @@ fn main() -> std::result::Result<(), String> {
     let gltf_contents = gltf::load("models/bistro/scene.gltf")?;
 
     // Load all meshes onto device
-    let mut meshes = Vec::<renderer::StaticMesh>::new();
-    for cpu_mesh in &gltf_contents.meshes {
-      meshes.push(renderer.new_static_mesh(cpu_mesh));
+    let mut meshes = Vec::<Vec<renderer::StaticMesh>>::new();
+    for cpu_mesh in gltf_contents.meshes.iter() {
+      let v = cpu_mesh.iter().map(|cpu_mesh|renderer.new_static_mesh(cpu_mesh)).collect();
+      meshes.push(v);
     }
 
     std::assert!(meshes.len() == gltf_contents.meshes.len());
@@ -76,8 +79,11 @@ fn main() -> std::result::Result<(), String> {
 
         let transform = parent_transform * node.local_transform;
 
-        if let Some(m) = node.mesh {
-          shit.push((renderer.new_transform(), transform, meshes[m]));
+        if let Some(mesh_idx) = node.mesh {
+          let meshes = &meshes[mesh_idx];
+          for m in meshes {
+            shit.push((renderer.new_transform(), transform, *m));
+          }
         }
 
         for c in &node.children {
@@ -125,7 +131,6 @@ fn main() -> std::result::Result<(), String> {
       let forward = (camera_rotation * Vector4::new(0.0, 0.0, -1.0, 0.0)).xyz();
       let right = forward.cross(&Vector3::new(0.0, 1.0, 0.0));
 
-
       if keydown(VK_W) {
         camera_pos += forward * camera_speed * delta_time;
       }
@@ -141,10 +146,12 @@ fn main() -> std::result::Result<(), String> {
       if keydown(VK_D) {                                                                    
         camera_pos += right * camera_speed * delta_time;
       }
+
+      renderer.acquire_frame();
       
       render_queue.clear();
       
-      for (t, matrix, mesh) in shit.iter().rev() {
+      for (t, matrix, mesh) in &shit {
         renderer.write_transform(*t, matrix);
         render_queue.push((*mesh, *t));
       }

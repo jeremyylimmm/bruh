@@ -92,6 +92,7 @@ struct ChunkHeader {
 }
 
 pub struct SceneNode {
+  pub name: String,
   pub local_transform: Matrix4<f32>,
   pub children: Vec<usize>,
   pub mesh: Option<usize>
@@ -188,7 +189,8 @@ pub fn load(path_str: &str) -> Result<Contents, &'static str> {
 
 pub
 struct Contents {
-  pub meshes: Vec<renderer::CPUStaticMesh>,
+  pub mesh_names: Vec<String>,
+  pub meshes: Vec<Vec<renderer::CPUStaticMesh>>,
   pub nodes: Vec<SceneNode>,
   pub scenes: Vec<Vec<usize>>,
   pub root_scene: usize
@@ -351,10 +353,13 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
     });
   }
 
-  let mut static_meshes = Vec::<renderer::CPUStaticMesh>::new();
+  let mut mesh_names = Vec::<String>::new();
+  let mut static_meshes = Vec::<Vec<renderer::CPUStaticMesh>>::new();
 
   // Process all meshes into static meshes
-  for m in &meshes {
+  for m in meshes {
+    let mut prims = Vec::new();
+
     for p in &m.primitives
     {
       let get_accessor = |name: &str| -> Result<&Accessor, &'static str> {
@@ -454,17 +459,28 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
         }
       }
 
-      static_meshes.push(renderer::CPUStaticMesh{
+      prims.push(renderer::CPUStaticMesh{
         vertex_data,
         index_data
       });
+
+      mesh_names.push(m.name.clone());
     }
+
+    static_meshes.push(prims);
   }
 
   let mut nodes = Vec::<SceneNode>::new();
 
   for n in root.get("nodes").ok_or("no nodes")?.as_array().ok_or("nodes not array")? {
     let node = n.as_obj().ok_or("node not object")?;
+
+    let name = if let Some(n) = node.get("name") {
+      n.as_string().ok_or("node name not string")?.clone()
+    }
+    else {
+      String::from("unnamed")
+    };
 
     let children: Vec<usize> = if node.contains_key("children") {
       let mut list = Vec::new();
@@ -515,7 +531,7 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
       let rotation = if node.contains_key("rotation") {
         let vec = as_vec::<4>(&node["rotation"])?;
         let quat = geometry::Quaternion::from_vector(vec);
-        geometry::UnitQuaternion::from_quaternion(-quat)
+        geometry::UnitQuaternion::from_quaternion(quat)
       }
       else {
         geometry::UnitQuaternion::identity()
@@ -529,6 +545,7 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
     };
 
     nodes.push(SceneNode{
+      name,
       local_transform,
       children,
       mesh
@@ -554,6 +571,7 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
   let root_scene = root.get("scene").ok_or("no root scene")?.as_integer().ok_or("root scene not integer")? as usize;
 
   return Ok(Contents{
+    mesh_names,
     meshes: static_meshes,
     nodes,
     scenes,
@@ -563,6 +581,10 @@ pub fn load_from_root(root: &HashMap<String, json::Node>, preloaded_buffers: &Op
 
 fn as_vec<const N: usize>(node: &json::Node) -> Result<Vector<f32, Const<N>, ArrayStorage<f32, N, 1>>, &'static str> {
   let s = node.as_array().ok_or("supposed vector not array")?;
+
+  if (s.len() != N) {
+    return Err("vector not properly sized");
+  }
 
   let mut vals = Vector::<f32, Const<N>, ArrayStorage<f32, N, 1>>::zeros(); 
 
