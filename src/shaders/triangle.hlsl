@@ -13,7 +13,7 @@ cbuffer Camera : register(b0, space0) {
   float4x4 view_proj;
 };
 
-cbuffer InstanceData : register(b1, space0) {
+cbuffer Constants : register(b1, space0) {
   uint vbuffer_index;
   uint ibuffer_index;
   uint transform_index;
@@ -25,7 +25,7 @@ struct Transform {
 
 StructuredBuffer<Vertex> vbuffers[] : register(t0, space0); 
 StructuredBuffer<uint> ibuffers[] : register(t0, space1); 
-ConstantBuffer<Transform> transforms[] : register(b0, space2);
+ConstantBuffer<Transform> transforms[] : register(b0, space1);
 
 VSOut vs_main(uint vid : SV_VertexID) {
   uint index = ibuffers[ibuffer_index][vid];

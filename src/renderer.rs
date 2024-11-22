@@ -1,10 +1,13 @@
 use renderer_pool_handle_derive::HandledPoolHandle;
-use windows::Win32::{Graphics::Direct3D12::*, Graphics::Direct3D::*, Graphics::Dxgi::Common::*, Graphics::Dxgi::*, Foundation::*, UI::WindowsAndMessaging::*};
+use windows::Win32::{Graphics::Direct3D::Fxc::*, Graphics::Direct3D::Dxc::*, Graphics::Direct3D12::*, Graphics::Direct3D::*, Graphics::Dxgi::Common::*, Graphics::Dxgi::*, Foundation::*, UI::WindowsAndMessaging::*};
 use windows::core::*;
+
+use std::io::*;
 
 use nalgebra::*;
 
 const FRAMES_IN_FLIGHT: usize = 2;
+const LINE_VBUFFER_CAP: usize = 10 * 1024;
 
 #[allow(dead_code)]
 pub struct Renderer {
@@ -26,8 +29,10 @@ pub struct Renderer {
   rtv_heap: DescriptorHeap,
   cbv_srv_uav_heap: DescriptorHeap,
   dsv_heap: DescriptorHeap,
-  root_signature: ID3D12RootSignature,
-  pipeline: ID3D12PipelineState,
+
+  line_pipeline: Pipeline, 
+  scene_pipeline: Pipeline,
+
   camera_cbuffer: BufferedBuffer<Matrix4<f32>>,
   depth_buffer: Option<ID3D12Resource>,
   dsv: DescriptorHandle,
@@ -36,6 +41,9 @@ pub struct Renderer {
   transform_pool: HandledPool<TransformData, Transform>,
 
   free_transforms: Vec<Transform>,
+
+  line_vbuffer_ptrs: [*mut LineVertex; FRAMES_IN_FLIGHT],
+  line_vbuffers: [ID3D12Resource; FRAMES_IN_FLIGHT],
 
   resident_resources: Vec<ID3D12Resource>
 }
@@ -90,6 +98,7 @@ impl Renderer {
         _ => { return Err("Failed to create device".into()); }
       };
 
+      let mut resident_resources = Vec::new();
 
       if cfg!(debug_assertions) {
         let info_queue = device.cast::<ID3D12InfoQueue>().map_err(|_|"Failed to get debug layer info queue")?;
@@ -163,159 +172,46 @@ impl Renderer {
 
       let rtvs: [DescriptorHandle;DXGI_MAX_SWAP_CHAIN_BUFFERS as _] = std::array::from_fn(|_|rtv_heap.alloc());
 
-      let vs_code = load_shader("shaders/triangle.vso")?;
-      let ps_code = load_shader("shaders/triangle.pso")?;
+      let line_pipeline_info = PipelineCreateInfo {
+        vs_code: load_shader("shaders/line.vso")?,
+        ps_code: load_shader("shaders/line.pso")?,
 
-      let ranges = [
-        D3D12_DESCRIPTOR_RANGE {
-          RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-          NumDescriptors: 0xffffffff,
-          BaseShaderRegister: 0,
-          RegisterSpace: 0,
-          OffsetInDescriptorsFromTableStart: 0
-        },
-        D3D12_DESCRIPTOR_RANGE {
-          RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-          NumDescriptors: 0xffffffff,
-          BaseShaderRegister: 0,
-          RegisterSpace: 1,
-          OffsetInDescriptorsFromTableStart: 0
-        },
-        D3D12_DESCRIPTOR_RANGE {
-          RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
-          NumDescriptors: 0xffffffff,
-          BaseShaderRegister: 0,
-          RegisterSpace: 2,
-          OffsetInDescriptorsFromTableStart: 0
-        }
-      ];
+        rtv_formats: &[swapchain_desc.BufferDesc.Format],
 
-      let root_params = [
-        D3D12_ROOT_PARAMETER{
-          ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
-          ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
-          Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Descriptor:  D3D12_ROOT_DESCRIPTOR {
-              ShaderRegister: 0,
-              RegisterSpace: 0
-            }
-          }
-        },
-        D3D12_ROOT_PARAMETER {
-          ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-          ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
-          Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Constants: D3D12_ROOT_CONSTANTS {
-              ShaderRegister: 1,
-              RegisterSpace: 0,
-              Num32BitValues: 3
-            }
-          }
-        },
-        D3D12_ROOT_PARAMETER{
-          ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-          ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
-          Anonymous: D3D12_ROOT_PARAMETER_0 {
-            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-              NumDescriptorRanges: ranges.len() as u32,
-              pDescriptorRanges: ranges.as_ptr()
-            }
-          },
-        }
-
-      ];
-
-      let root_signature_desc = D3D12_ROOT_SIGNATURE_DESC {
-        pParameters: root_params.as_ptr(),
-        NumParameters: root_params.len() as u32,
-        ..Default::default()
-      };
-
-      let mut root_signature_code_opt: Option<ID3DBlob> = None;
-      D3D12SerializeRootSignature(&root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut root_signature_code_opt, None).map_err(|_|"Failed to serialize root signature")?;
-      let root_signature_code = root_signature_code_opt.unwrap();
-
-      let root_signature = device.CreateRootSignature(
-        0,
-        std::slice::from_raw_parts(root_signature_code.GetBufferPointer() as _, root_signature_code.GetBufferSize())
-      ).map_err(|_|"Failed to create root signature")?;
-
-      let mut pipeline_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-        pRootSignature: std::mem::transmute_copy(&root_signature),
-
-        VS: D3D12_SHADER_BYTECODE {
-          pShaderBytecode: vs_code.as_ptr() as _,
-          BytecodeLength: vs_code.len()
-        },
-
-        PS: D3D12_SHADER_BYTECODE {
-          pShaderBytecode: ps_code.as_ptr() as _,
-          BytecodeLength: ps_code.len()
-        },
-
-        BlendState: D3D12_BLEND_DESC {
-          RenderTarget: std::array::from_fn(|_|D3D12_RENDER_TARGET_BLEND_DESC{
-            SrcBlend:	D3D12_BLEND_ONE,
-            BlendOp:	D3D12_BLEND_OP_ADD,
-            SrcBlendAlpha:	D3D12_BLEND_ONE,
-            BlendOpAlpha:	D3D12_BLEND_OP_ADD,
-            LogicOp:	D3D12_LOGIC_OP_NOOP,
-            RenderTargetWriteMask: 0b1111,
-            ..Default::default()
-          }),
-          ..Default::default()
-        },
-
-        SampleMask: 0xffffffff,
-
-        RasterizerState: D3D12_RASTERIZER_DESC {
-          FillMode:	D3D12_FILL_MODE_SOLID,
-          CullMode:	D3D12_CULL_MODE_BACK,
-          FrontCounterClockwise: TRUE,
-          DepthClipEnable:	TRUE,
-          ..Default::default()
-        },
-
-        DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
-          DepthEnable:	TRUE,
-          DepthWriteMask:	D3D12_DEPTH_WRITE_MASK_ALL,
-          DepthFunc:	D3D12_COMPARISON_FUNC_LESS,
-          StencilEnable: FALSE,
-          StencilReadMask:	D3D12_DEFAULT_STENCIL_READ_MASK as _,
-          StencilWriteMask:	D3D12_DEFAULT_STENCIL_WRITE_MASK as _,
-
-          BackFace: D3D12_DEPTH_STENCILOP_DESC{
-            StencilFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilPassOp: D3D12_STENCIL_OP_KEEP,
-            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
-          }, 
-
-          FrontFace: D3D12_DEPTH_STENCILOP_DESC{
-            StencilFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilPassOp: D3D12_STENCIL_OP_KEEP,
-            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
-          }, 
-        },
-
-        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-
-        NumRenderTargets: 1,
-
-        SampleDesc: DXGI_SAMPLE_DESC {
-          Count: 1,
-          Quality: 0
-        },
-
-        DSVFormat: DXGI_FORMAT_D32_FLOAT,
+        root_params: &[
+          root_param_cbv(D3D12_SHADER_VISIBILITY_VERTEX, 0, 0),
+          root_param_srv(D3D12_SHADER_VISIBILITY_VERTEX, 0, 0),
+        ],
         
-        ..Default::default()
+        primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
       };
 
-      pipeline_desc.RTVFormats[0] = swapchain_desc.BufferDesc.Format;
+      let scene_pipeline_info = PipelineCreateInfo {
+        vs_code: load_shader("shaders/triangle.vso")?,
+        ps_code: load_shader("shaders/triangle.pso")?,
 
-      let pipeline = device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed t create pipeline")?;
+        rtv_formats: &[swapchain_desc.BufferDesc.Format],
+
+        root_params: &[
+          root_param_cbv(D3D12_SHADER_VISIBILITY_VERTEX, 0, 0)
+        ],
+        
+        primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+      };
+
+      let line_pipeline= Pipeline::create(&device, &line_pipeline_info)?;
+      let scene_pipeline= Pipeline::create(&device, &scene_pipeline_info)?;
+
+      // Line vbuffer
+
+      let mut line_vbuffer_ptrs = [std::ptr::null_mut::<LineVertex>();FRAMES_IN_FLIGHT];
+      let mut line_vbuffers = std::array::from_fn(|_|make_buffer(&device, LINE_VBUFFER_CAP * std::mem::size_of::<LineVertex>(), D3D12_HEAP_TYPE_UPLOAD));
+
+      for i in 0..FRAMES_IN_FLIGHT {
+        let mut ptr = std::ptr::null_mut();
+        line_vbuffers[i].Map(0, None, Some(&mut ptr));
+        line_vbuffer_ptrs[i] = ptr as _;
+      }
 
       let mut renderer = Renderer {
         dsv: dsv_heap.alloc(),
@@ -338,13 +234,20 @@ impl Renderer {
         rtv_heap,
         cbv_srv_uav_heap,
         dsv_heap,
-        root_signature,
-        pipeline,
+
+        line_pipeline,
+        scene_pipeline,
+
+
         depth_buffer: None,
         static_mesh_pool: HandledPool::new(),
         transform_pool: HandledPool::new(),
         free_transforms: Vec::new(),
-        resident_resources: Vec::new()
+
+        line_vbuffer_ptrs,
+        line_vbuffers,
+
+        resident_resources
       };
 
       renderer.init_swapchain_resources();
@@ -383,12 +286,6 @@ impl Renderer {
       cmd_list.ClearRenderTargetView(self.swapchain_rtvs[swapchain_index], &[0.1, 0.1, 0.1, 1.0], None); 
       cmd_list.OMSetRenderTargets(1, Some(&self.swapchain_rtvs[swapchain_index]), None, Some(&self.dsv_heap.cpu_handle(self.dsv)));
 
-      cmd_list.SetGraphicsRootSignature(&self.root_signature);
-      cmd_list.SetPipelineState(&self.pipeline);
-
-      cmd_list.SetDescriptorHeaps(&[Some(self.cbv_srv_uav_heap.heap.clone())]);
-      cmd_list.SetGraphicsRootDescriptorTable(2, self.cbv_srv_uav_heap.gpu_base);
-
       cmd_list.RSSetViewports(&[
         D3D12_VIEWPORT {
           Width: self.swapchain_w as f32,
@@ -406,7 +303,12 @@ impl Renderer {
         }
       ]);
 
-      cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+      
+
+      // Render the scene
+
+      self.scene_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
 
       let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
       let proj_matrix = Matrix4::new_perspective(aspect, 3.1415 * 0.5, 0.1, 1000.0);
@@ -416,17 +318,47 @@ impl Renderer {
 
       cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame, 0));
 
+      cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
       for (mesh_handle, transform) in meshes {
         let m = self.static_mesh_pool.get(*mesh_handle);
         let t = self.transform_pool.get(*transform);
 
-        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.vbuffer_srv) as u32, 0); // Set vbuffer index
-        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(m.ibuffer_srv) as u32, 1); // Set ibuffer index
-
-        cmd_list.SetGraphicsRoot32BitConstant(1, self.cbv_srv_uav_heap.verify_handle(t.cbvs[self.frame]) as u32, 2);
+        self.scene_pipeline.set_32bit_constant(&cmd_list, self.cbv_srv_uav_heap.verify_handle(m.vbuffer_srv) as u32, 0);
+        self.scene_pipeline.set_32bit_constant(&cmd_list, self.cbv_srv_uav_heap.verify_handle(m.ibuffer_srv) as u32, 1);
+        self.scene_pipeline.set_32bit_constant(&cmd_list, self.cbv_srv_uav_heap.verify_handle(t.cbvs[self.frame]) as u32, 2);
 
         cmd_list.DrawInstanced(m.index_count as u32, 1, 0, 0);
       }
+
+
+
+      
+      // Render some lines
+
+      self.line_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
+
+      let mut line_vertex_count: usize = 0;
+
+      let mut push_line = |a: Vector3<f32>, b: Vector3<f32>| {
+        for v in [a, b] {
+          if line_vertex_count < LINE_VBUFFER_CAP {
+            std::ptr::copy_nonoverlapping(&LineVertex{pos:v,pad:0.0}, self.line_vbuffer_ptrs[self.frame].add(line_vertex_count), 1);
+            line_vertex_count += 1;
+          }
+        }
+      };
+
+      push_line(Vector3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 10.0, 0.0));
+
+      cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame, 0));
+      cmd_list.SetGraphicsRootShaderResourceView(1, self.line_vbuffers[self.frame].GetGPUVirtualAddress());
+
+      cmd_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+      cmd_list.DrawInstanced(line_vertex_count as u32, 1, 0, 0);
+
+
+
 
       cmd_list.ResourceBarrier(&[transition_barrier(&self.swapchain_buffers[swapchain_index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
 
@@ -638,8 +570,272 @@ impl Renderer {
     self.wait(val);
   }
 
-  
 }
+
+struct PipelineCreateInfo<'a> {
+  vs_code: ID3DBlob,
+  ps_code: ID3DBlob,
+  rtv_formats: &'a [DXGI_FORMAT],
+  root_params: &'a [D3D12_ROOT_PARAMETER],
+  primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE
+}
+
+struct Pipeline {
+  root_signature: ID3D12RootSignature,
+  pipeline: ID3D12PipelineState,
+  bindless_table_index: Option<u32>,
+  constants_index: Option<u32>,
+}
+
+fn root_param_cbv(shader_visibility: D3D12_SHADER_VISIBILITY, register: u32, space: u32) -> D3D12_ROOT_PARAMETER {
+  D3D12_ROOT_PARAMETER {
+    ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+    ShaderVisibility: shader_visibility,
+    Anonymous: D3D12_ROOT_PARAMETER_0 {
+      Descriptor:  D3D12_ROOT_DESCRIPTOR {
+        ShaderRegister: register,
+        RegisterSpace: space 
+      }
+    }
+  }
+}
+
+fn root_param_srv(shader_visibility: D3D12_SHADER_VISIBILITY, register: u32, space: u32) -> D3D12_ROOT_PARAMETER {
+  D3D12_ROOT_PARAMETER {
+    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+    ShaderVisibility: shader_visibility,
+    Anonymous: D3D12_ROOT_PARAMETER_0 {
+      Descriptor:  D3D12_ROOT_DESCRIPTOR {
+        ShaderRegister: register,
+        RegisterSpace: space 
+      }
+    }
+  }
+}
+
+fn shader_input_type_to_descriptor_range_type(input: D3D_SHADER_INPUT_TYPE) -> D3D12_DESCRIPTOR_RANGE_TYPE {
+  return match input {
+    D3D_SIT_CBUFFER => D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+    D3D_SIT_TBUFFER => D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+    D3D_SIT_TEXTURE => D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+    D3D_SIT_SAMPLER => D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+    D3D_SIT_UAV_RWTYPED => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D_SIT_STRUCTURED => D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 
+    D3D_SIT_UAV_RWSTRUCTURED => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D_SIT_BYTEADDRESS => D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+    D3D_SIT_UAV_RWBYTEADDRESS => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D_SIT_UAV_APPEND_STRUCTURED => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D_SIT_UAV_CONSUME_STRUCTURED => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D_SIT_RTACCELERATIONSTRUCTURE => D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+    D3D_SIT_UAV_FEEDBACKTEXTURE => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    _ => panic!("invalid shader input type given")
+  }
+}
+
+impl Pipeline {
+  fn create(device: &ID3D12Device, info: &PipelineCreateInfo) -> std::result::Result<Pipeline, &'static str> {
+    let mut root_params = info.root_params.to_vec();
+    let mut ranges = Vec::<D3D12_DESCRIPTOR_RANGE>::new();
+
+    let mut bindless_table_index = None;
+    let mut constants_index = None;
+
+    unsafe {
+      let container: IDxcContainerReflection = DxcCreateInstance(&CLSID_DxcContainerReflection).map_err(|_|"failed to reflect")?;
+      let blob = info.vs_code.clone().cast::<IDxcBlob>().unwrap();
+      container.Load(&blob);
+
+      let kind = u32::from_le_bytes([b'D', b'X', b'I', b'L']);
+      let part_index = container.FindFirstPartKind(kind).unwrap();
+
+      let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+      container.GetPartReflection(part_index, &ID3D12ShaderReflection::IID, &mut ptr).map_err(|_|"failed to reflect")?;
+
+      let reflection = ID3D12ShaderReflection::from_raw(ptr);
+
+      let mut desc = D3D12_SHADER_DESC::default();
+      reflection.GetDesc(&mut desc);
+
+      for i in 0..desc.BoundResources {
+        let mut binding = D3D12_SHADER_INPUT_BIND_DESC::default();
+        reflection.GetResourceBindingDesc(i, &mut binding);
+
+        let name = std::ffi::CStr::from_ptr(binding.Name.0 as _).to_str().unwrap();
+
+        if name == "Constants" {
+          constants_index = Some(root_params.len() as u32);
+          
+          let cbuffer = reflection.GetConstantBufferByName(windows::core::s!("Constants")).unwrap();
+          let mut cbuffer_desc = D3D12_SHADER_BUFFER_DESC::default();
+          cbuffer.GetDesc(&mut cbuffer_desc);
+
+          root_params.push(D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+              Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: binding.BindPoint,
+                RegisterSpace: binding.Space,
+                Num32BitValues: cbuffer_desc.Size / 4
+              }
+            }
+          });
+        }
+        else if binding.BindCount == 0xffffffff || binding.BindCount == 0 {
+          // Bindless table
+          ranges.push(D3D12_DESCRIPTOR_RANGE{
+            RangeType: shader_input_type_to_descriptor_range_type(binding.Type),
+            NumDescriptors: u32::MAX,
+            BaseShaderRegister: binding.BindPoint,
+            RegisterSpace: binding.Space,
+            OffsetInDescriptorsFromTableStart: 0
+          });
+        }
+      }
+    }
+
+    if !ranges.is_empty() {
+      bindless_table_index = Some(root_params.len() as u32);
+
+      root_params.push(D3D12_ROOT_PARAMETER{
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+          DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+            NumDescriptorRanges: ranges.len() as u32,
+            pDescriptorRanges: ranges.as_ptr()
+          }
+        },
+      });
+    }
+
+    let root_signature_desc = D3D12_ROOT_SIGNATURE_DESC {
+      pParameters: root_params.as_ptr(),
+      NumParameters: root_params.len() as u32,
+      ..Default::default()
+    };
+
+    let mut root_signature_code_opt: Option<ID3DBlob> = None;
+
+    unsafe{
+      D3D12SerializeRootSignature(&root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut root_signature_code_opt, None).map_err(|_|"Failed to serialize root signature")?;
+    }
+
+    let root_signature_code = root_signature_code_opt.unwrap();
+
+    let root_signature= unsafe {device.CreateRootSignature(
+      0,
+      std::slice::from_raw_parts(root_signature_code.GetBufferPointer() as _, root_signature_code.GetBufferSize())
+    ).map_err(|_|"Failed to create root signature")?};
+
+    let mut pipeline_desc = unsafe { D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+      pRootSignature: unsafe{std::mem::transmute_copy(&root_signature)},
+
+      VS: D3D12_SHADER_BYTECODE {
+        pShaderBytecode: info.vs_code.GetBufferPointer(),
+        BytecodeLength: info.vs_code.GetBufferSize()
+      },
+
+      PS: D3D12_SHADER_BYTECODE {
+        pShaderBytecode: info.ps_code.GetBufferPointer() as _,
+        BytecodeLength: info.ps_code.GetBufferSize()
+      },
+
+      BlendState: D3D12_BLEND_DESC {
+        RenderTarget: std::array::from_fn(|_|D3D12_RENDER_TARGET_BLEND_DESC{
+          SrcBlend:	D3D12_BLEND_ONE,
+          BlendOp:	D3D12_BLEND_OP_ADD,
+          SrcBlendAlpha:	D3D12_BLEND_ONE,
+          BlendOpAlpha:	D3D12_BLEND_OP_ADD,
+          LogicOp:	D3D12_LOGIC_OP_NOOP,
+          RenderTargetWriteMask: 0b1111,
+          ..Default::default()
+        }),
+        ..Default::default()
+      },
+
+      SampleMask: 0xffffffff,
+
+      RasterizerState: D3D12_RASTERIZER_DESC {
+        FillMode:	D3D12_FILL_MODE_SOLID,
+        CullMode:	D3D12_CULL_MODE_BACK,
+        FrontCounterClockwise: TRUE,
+        DepthClipEnable:	TRUE,
+        ..Default::default()
+      },
+
+      DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+        DepthEnable:	TRUE,
+        DepthWriteMask:	D3D12_DEPTH_WRITE_MASK_ALL,
+        DepthFunc:	D3D12_COMPARISON_FUNC_LESS,
+        StencilEnable: FALSE,
+        StencilReadMask:	D3D12_DEFAULT_STENCIL_READ_MASK as _,
+        StencilWriteMask:	D3D12_DEFAULT_STENCIL_WRITE_MASK as _,
+
+        BackFace: D3D12_DEPTH_STENCILOP_DESC{
+          StencilFailOp: D3D12_STENCIL_OP_KEEP,
+          StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+          StencilPassOp: D3D12_STENCIL_OP_KEEP,
+          StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        }, 
+
+        FrontFace: D3D12_DEPTH_STENCILOP_DESC{
+          StencilFailOp: D3D12_STENCIL_OP_KEEP,
+          StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+          StencilPassOp: D3D12_STENCIL_OP_KEEP,
+          StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        }, 
+      },
+
+      PrimitiveTopologyType: info.primitive_topology_type,
+
+      NumRenderTargets: info.rtv_formats.len() as u32,
+
+      SampleDesc: DXGI_SAMPLE_DESC {
+        Count: 1,
+        Quality: 0
+      },
+
+      DSVFormat: DXGI_FORMAT_D32_FLOAT,
+      
+      ..Default::default()
+    }};
+
+    for (i, f) in info.rtv_formats.iter().enumerate() {
+      pipeline_desc.RTVFormats[i] = *f;
+    }
+
+    let pipeline = unsafe{device.CreateGraphicsPipelineState(&pipeline_desc).map_err(|_|"Failed to create pipeline")?};
+
+    return Ok(Pipeline {
+      root_signature,
+      pipeline,
+      bindless_table_index,
+      constants_index,
+    });
+  }
+
+  fn bind(&self, cmd_list: &ID3D12GraphicsCommandList, bindless_heap: &DescriptorHeap) {
+    unsafe {
+      cmd_list.SetGraphicsRootSignature(&self.root_signature);
+      cmd_list.SetPipelineState(&self.pipeline);
+
+      cmd_list.SetDescriptorHeaps(&[Some(bindless_heap.heap.clone())]);
+
+      if let Some(i) = self.bindless_table_index {
+        cmd_list.SetGraphicsRootDescriptorTable(i, bindless_heap.gpu_base);
+      }
+    }
+  }
+
+  fn set_32bit_constant(&self, cmd_list: &ID3D12GraphicsCommandList, value: u32, index: u32) {
+    unsafe {
+      cmd_list.SetGraphicsRoot32BitConstant(self.constants_index.unwrap(), value, index);
+    }
+  }
+}
+  
 
 fn transition_barrier(resource: &ID3D12Resource, state_before: D3D12_RESOURCE_STATES, state_after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
   return D3D12_RESOURCE_BARRIER {
@@ -658,8 +854,18 @@ fn transition_barrier(resource: &ID3D12Resource, state_before: D3D12_RESOURCE_ST
   };
 }
 
-fn load_shader(path: &str) -> std::result::Result<Vec<u8>, String> {
-  return std::fs::read(path).map_err(|_|format!("Missing file {}", path));
+fn load_shader(path: &str) -> std::result::Result<ID3DBlob, String> {
+  let mut file = std::fs::File::open(path).map_err(|_|format!("Missing file {}", path))?;
+  let len = file.seek(SeekFrom::End(0)).unwrap() as usize;
+
+  let blob = unsafe{ D3DCreateBlob(len) }.unwrap();
+  let slice = unsafe{std::slice::from_raw_parts_mut(blob.GetBufferPointer() as *mut u8, blob.GetBufferSize())};
+
+  file.seek(SeekFrom::Start(0));
+
+  file.read(slice).map_err(|_|"failed to read shader code");
+
+  return Ok(blob);
 }
 
 impl Drop for Renderer {
@@ -946,4 +1152,8 @@ struct TransformData {
   ptrs: [*mut Matrix4<f32>; FRAMES_IN_FLIGHT]
 }
 
-
+#[repr(packed)]
+struct LineVertex {
+  pos: Vector3<f32>,
+  pad: f32
+}
