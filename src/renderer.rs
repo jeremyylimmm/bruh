@@ -304,14 +304,14 @@ impl Renderer {
       ]);
 
 
-      
+
 
       // Render the scene
 
       self.scene_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
 
       let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
-      let proj_matrix = Matrix4::new_perspective(aspect, 3.1415 * 0.5, 0.1, 1000.0);
+      let proj_matrix = Matrix4::new_perspective(aspect, 3.1415 * 0.5, 0.01, 1000.0);
 
       let view_proj = proj_matrix * view_matrix;
       self.camera_cbuffer.write(self.frame, 0, &view_proj);
@@ -336,7 +336,26 @@ impl Renderer {
       
       // Render some lines
 
-      self.line_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
+      let test_cam= Matrix4::new_translation(&Vector3::new(-5.0, 2.0, 2.0));
+      let test_view = test_cam.try_inverse().unwrap();
+      let test_proj = Matrix4::new_perspective(aspect, 3.1415 * 0.25, 0.1, 10.0);
+
+      let test_inv_view_proj = (test_proj * test_view).try_inverse().unwrap();
+
+      let box_points: Vec<Vector3<f32>> = [
+        Vector3::new(-1.0,  1.0, 0.0),
+        Vector3::new( 1.0,  1.0, 0.0),
+        Vector3::new( 1.0, -1.0, 0.0),
+        Vector3::new(-1.0, -1.0, 0.0),
+        Vector3::new(-1.0,  1.0, 1.0),
+        Vector3::new( 1.0,  1.0, 1.0),
+        Vector3::new( 1.0, -1.0, 1.0),
+        Vector3::new(-1.0, -1.0, 1.0),
+      ].iter().map(|p|{
+        let v = Vector4::new(p.x, p.y, p.z, 1.0);
+        let h =  test_inv_view_proj * v;
+        h.xyz() / h.w
+      }).collect();
 
       let mut line_vertex_count: usize = 0;
 
@@ -349,7 +368,13 @@ impl Renderer {
         }
       };
 
-      push_line(Vector3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 10.0, 0.0));
+      for i in 0..4 {
+        push_line(box_points[i+0%4], box_points[(i+1)%4]);
+        push_line(box_points[i], box_points[i+4]);
+        push_line(box_points[i+0%4+4], box_points[(i+1)%4+4]);
+      }
+
+      self.line_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
 
       cmd_list.SetGraphicsRootConstantBufferView(0, self.camera_cbuffer.gpu_virtual_address(self.frame, 0));
       cmd_list.SetGraphicsRootShaderResourceView(1, self.line_vbuffers[self.frame].GetGPUVirtualAddress());
