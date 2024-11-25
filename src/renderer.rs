@@ -2,6 +2,7 @@ use renderer_pool_handle_derive::HandledPoolHandle;
 use windows::Win32::{Graphics::Direct3D::Fxc::*, Graphics::Direct3D::Dxc::*, Graphics::Direct3D12::*, Graphics::Direct3D::*, Graphics::Dxgi::Common::*, Graphics::Dxgi::*, Foundation::*, UI::WindowsAndMessaging::*};
 use windows::core::*;
 
+use std::convert::identity;
 use std::io::*;
 
 use nalgebra::*;
@@ -282,7 +283,7 @@ impl Renderer {
         ..Default::default()
       };
 
-      cmd_list.ClearDepthStencilView(self.dsv_heap.cpu_handle(self.dsv), D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[clear_rect]);
+      cmd_list.ClearDepthStencilView(self.dsv_heap.cpu_handle(self.dsv), D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, &[clear_rect]);
       cmd_list.ClearRenderTargetView(self.swapchain_rtvs[swapchain_index], &[0.1, 0.1, 0.1, 1.0], None); 
       cmd_list.OMSetRenderTargets(1, Some(&self.swapchain_rtvs[swapchain_index]), None, Some(&self.dsv_heap.cpu_handle(self.dsv)));
 
@@ -311,7 +312,7 @@ impl Renderer {
       self.scene_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
 
       let aspect = self.swapchain_w as f32 / self.swapchain_h as f32;
-      let proj_matrix = Matrix4::new_perspective(aspect, 3.1415 * 0.5, 0.01, 1000.0);
+      let proj_matrix = perspective_inf_rev_z(aspect, 3.1415 * 0.5, 0.01);
 
       let view_proj = proj_matrix * view_matrix;
       self.camera_cbuffer.write(self.frame, 0, &view_proj);
@@ -338,19 +339,19 @@ impl Renderer {
 
       let test_cam= Matrix4::new_translation(&Vector3::new(-5.0, 2.0, 2.0));
       let test_view = test_cam.try_inverse().unwrap();
-      let test_proj = Matrix4::new_perspective(aspect, 3.1415 * 0.25, 0.1, 10.0);
+      let test_proj = perspective_inf_rev_z(1.0, std::f32::consts::PI * 0.5, 0.1);
 
       let test_inv_view_proj = (test_proj * test_view).try_inverse().unwrap();
 
       let box_points: Vec<Vector3<f32>> = [
-        Vector3::new(-1.0,  1.0, 0.0),
-        Vector3::new( 1.0,  1.0, 0.0),
-        Vector3::new( 1.0, -1.0, 0.0),
-        Vector3::new(-1.0, -1.0, 0.0),
         Vector3::new(-1.0,  1.0, 1.0),
         Vector3::new( 1.0,  1.0, 1.0),
         Vector3::new( 1.0, -1.0, 1.0),
         Vector3::new(-1.0, -1.0, 1.0),
+        Vector3::new(-1.0,  1.0, 0.01),
+        Vector3::new( 1.0,  1.0, 0.01),
+        Vector3::new( 1.0, -1.0, 0.01),
+        Vector3::new(-1.0, -1.0, 0.01),
       ].iter().map(|p|{
         let v = Vector4::new(p.x, p.y, p.z, 1.0);
         let h =  test_inv_view_proj * v;
@@ -369,9 +370,9 @@ impl Renderer {
       };
 
       for i in 0..4 {
-        push_line(box_points[i+0%4], box_points[(i+1)%4]);
+        push_line(box_points[i], box_points[(i+1)%4]);
         push_line(box_points[i], box_points[i+4]);
-        push_line(box_points[i+0%4+4], box_points[(i+1)%4+4]);
+        push_line(box_points[i+4], box_points[(i+1)%4+4]);
       }
 
       self.line_pipeline.bind(&cmd_list, &self.cbv_srv_uav_heap);
@@ -558,7 +559,7 @@ impl Renderer {
         Format: dsv_desc.Format,
         Anonymous: D3D12_CLEAR_VALUE_0 {
           DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
-            Depth: 1.0,
+            Depth: 0.0,
             Stencil: 0
           }
         }
@@ -793,7 +794,7 @@ impl Pipeline {
       DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
         DepthEnable:	TRUE,
         DepthWriteMask:	D3D12_DEPTH_WRITE_MASK_ALL,
-        DepthFunc:	D3D12_COMPARISON_FUNC_LESS,
+        DepthFunc:	D3D12_COMPARISON_FUNC_GREATER,
         StencilEnable: FALSE,
         StencilReadMask:	D3D12_DEFAULT_STENCIL_READ_MASK as _,
         StencilWriteMask:	D3D12_DEFAULT_STENCIL_WRITE_MASK as _,
@@ -1181,4 +1182,20 @@ struct TransformData {
 struct LineVertex {
   pos: Vector3<f32>,
   pad: f32
+}
+
+fn perspective_inf_rev_z(aspect: f32, fovy: f32, znear: f32) -> Matrix4<f32> {
+  let mut res = Matrix4::<f32>::zeros();
+
+  let tan_fov = (fovy*0.5).tan();
+
+  res[(0, 0)] = 1.0 / (tan_fov * aspect);
+  res[(1, 1)] = 1.0 / tan_fov;
+
+  res[(2, 2)] = 0.0;
+  res[(2, 3)] = znear;
+
+  res[(3, 2)] = -1.0;
+
+  return res;
 }

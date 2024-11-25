@@ -177,7 +177,7 @@ fn main() -> std::result::Result<(), String> {
 
     let mut last_time = std::time::Instant::now();
 
-    let camera_speed: f32 = 5.0;
+    let camera_speed: f32 = 10.0;
 
     let mut camera_pitch = 0.0;
     let mut camera_yaw = 0.0;
